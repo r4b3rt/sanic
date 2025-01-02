@@ -1,12 +1,18 @@
 import asyncio
+import inspect
 import logging
+import os
 import random
 import re
+import socket
 import string
 import sys
 import uuid
 
-from typing import Tuple
+from contextlib import suppress
+from logging import LogRecord
+from typing import Any
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -15,6 +21,7 @@ from sanic_testing.testing import PORT
 
 from sanic import Sanic
 from sanic.constants import HTTP_METHODS
+from sanic.logging.formatter import AutoFormatter
 from sanic.router import Router
 from sanic.touchup.service import TouchUp
 
@@ -25,6 +32,19 @@ Sanic.test_mode = True
 
 if sys.platform in ["win32", "cygwin"]:
     collect_ignore = ["test_worker.py"]
+
+
+def get_port():
+    sock = socket.socket()
+    sock.bind(
+        ("", 0)
+    )  # Bind to 0 port, so os will pick available port for us.
+    return sock.getsockname()[1]
+
+
+@pytest.fixture(scope="function")
+def port():
+    yield get_port()
 
 
 async def _handler(request):
@@ -51,11 +71,10 @@ TYPE_TO_GENERATOR_MAP = {
     "uuid": lambda: str(uuid.uuid1()),
 }
 
-CACHE = {}
+CACHE: dict[str, Any] = {}
 
 
 class RouteStringGenerator:
-
     ROUTE_COUNT_PER_DEPTH = 100
     HTTP_METHODS = HTTP_METHODS
     ROUTE_PARAM_TYPES = ["str", "int", "float", "alpha", "uuid"]
@@ -107,7 +126,7 @@ class RouteStringGenerator:
 @pytest.fixture(scope="function")
 def sanic_router(app):
     # noinspection PyProtectedMember
-    def _setup(route_details: tuple) -> Tuple[Router, tuple]:
+    def _setup(route_details: tuple) -> tuple[Router, tuple]:
         router = Router()
         router.ctx.app = app
         added_router = []
@@ -123,7 +142,7 @@ def sanic_router(app):
             except RouteExists:
                 pass
         router.finalize()
-        return router, added_router
+        return router, tuple(added_router)
 
     return _setup
 
@@ -144,9 +163,15 @@ def app(request):
         for target, method_name in TouchUp._registry:
             CACHE[method_name] = getattr(target, method_name)
     app = Sanic(slugify.sub("-", request.node.name))
+
     yield app
     for target, method_name in TouchUp._registry:
         setattr(target, method_name, CACHE[method_name])
+    Sanic._app_registry.clear()
+    AutoFormatter.SETUP = False
+    AutoFormatter.LOG_EXTRA = False
+    os.environ.pop("SANIC_LOG_EXTRA", None)
+    os.environ.pop("SANIC_NO_COLOR", None)
 
 
 @pytest.fixture(scope="function")
@@ -170,3 +195,69 @@ def run_startup(caplog):
         return caplog.record_tuples
 
     return run
+
+
+@pytest.fixture
+def run_multi(caplog):
+    def run(app, level=logging.DEBUG):
+        @app.after_server_start
+        async def stop(app, _):
+            app.stop()
+
+        with caplog.at_level(level):
+            Sanic.serve()
+
+        return caplog.record_tuples
+
+    return run
+
+
+@pytest.fixture(scope="function")
+def message_in_records():
+    def msg_in_log(records: list[LogRecord], msg: str):
+        error_captured = False
+        for record in records:
+            if msg in record.message:
+                error_captured = True
+                break
+        return error_captured
+
+    return msg_in_log
+
+
+@pytest.fixture
+def ext_instance():
+    ext_instance = MagicMock()
+    ext_instance.injection = MagicMock()
+    return ext_instance
+
+
+@pytest.fixture(autouse=True)  # type: ignore
+def mock_sanic_ext(ext_instance):  # noqa
+    mock_sanic_ext = MagicMock(__version__="1.2.3")
+    mock_sanic_ext.Extend = MagicMock()
+    mock_sanic_ext.Extend.return_value = ext_instance
+    sys.modules["sanic_ext"] = mock_sanic_ext
+    yield mock_sanic_ext
+    with suppress(KeyError):
+        del sys.modules["sanic_ext"]
+
+
+@pytest.fixture
+def urlopen():
+    urlopen = Mock()
+    urlopen.return_value = urlopen
+    urlopen.__enter__ = Mock(return_value=urlopen)
+    urlopen.__exit__ = Mock()
+    urlopen.read = Mock()
+    with patch("sanic.cli.inspector_client.urlopen", urlopen):
+        yield urlopen
+
+
+@pytest.fixture(scope="module")
+def static_file_directory():
+    """The static directory to serve"""
+    current_file = inspect.getfile(inspect.currentframe())
+    current_directory = os.path.dirname(os.path.abspath(current_file))
+    static_directory = os.path.join(current_directory, "static")
+    return static_directory

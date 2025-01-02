@@ -1,80 +1,24 @@
-import logging
-import sys
-
-from enum import Enum
-from typing import Any, Dict
-
-
-LOGGING_CONFIG_DEFAULTS: Dict[str, Any] = dict(
-    version=1,
-    disable_existing_loggers=False,
-    loggers={
-        "sanic.root": {"level": "INFO", "handlers": ["console"]},
-        "sanic.error": {
-            "level": "INFO",
-            "handlers": ["error_console"],
-            "propagate": True,
-            "qualname": "sanic.error",
-        },
-        "sanic.access": {
-            "level": "INFO",
-            "handlers": ["access_console"],
-            "propagate": True,
-            "qualname": "sanic.access",
-        },
-    },
-    handlers={
-        "console": {
-            "class": "logging.StreamHandler",
-            "formatter": "generic",
-            "stream": sys.stdout,
-        },
-        "error_console": {
-            "class": "logging.StreamHandler",
-            "formatter": "generic",
-            "stream": sys.stderr,
-        },
-        "access_console": {
-            "class": "logging.StreamHandler",
-            "formatter": "access",
-            "stream": sys.stdout,
-        },
-    },
-    formatters={
-        "generic": {
-            "format": "%(asctime)s [%(process)d] [%(levelname)s] %(message)s",
-            "datefmt": "[%Y-%m-%d %H:%M:%S %z]",
-            "class": "logging.Formatter",
-        },
-        "access": {
-            "format": "%(asctime)s - (%(name)s)[%(levelname)s][%(host)s]: "
-            + "%(request)s %(message)s %(status)d %(byte)d",
-            "datefmt": "[%Y-%m-%d %H:%M:%S %z]",
-            "class": "logging.Formatter",
-        },
-    },
+from sanic.logging.color import Colors
+from sanic.logging.default import LOGGING_CONFIG_DEFAULTS
+from sanic.logging.deprecation import deprecation
+from sanic.logging.filter import VerbosityFilter
+from sanic.logging.loggers import (
+    access_logger,
+    error_logger,
+    logger,
+    server_logger,
+    websockets_logger,
 )
 
 
-class Colors(str, Enum):
-    END = "\033[0m"
-    BLUE = "\033[01;34m"
-    GREEN = "\033[01;32m"
-    YELLOW = "\033[01;33m"
-    RED = "\033[01;31m"
-
-
-logger = logging.getLogger("sanic.root")
-"""
-General Sanic logger
-"""
-
-error_logger = logging.getLogger("sanic.error")
-"""
-Logger used by Sanic for error logging
-"""
-
-access_logger = logging.getLogger("sanic.access")
-"""
-Logger used by Sanic for access logging
-"""
+__all__ = (
+    "deprecation",
+    "logger",
+    "access_logger",
+    "error_logger",
+    "server_logger",
+    "websockets_logger",
+    "VerbosityFilter",
+    "Colors",
+    "LOGGING_CONFIG_DEFAULTS",
+)

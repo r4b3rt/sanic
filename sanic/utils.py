@@ -48,7 +48,7 @@ def load_module_from_file_location(
     """Returns loaded module provided as a file path.
 
     :param args:
-        Coresponds to importlib.util.spec_from_file_location location
+        Corresponds to importlib.util.spec_from_file_location location
         parameters,but with this differences:
         - It has to be of a string or bytes type.
         - You can also use here environment variables
@@ -58,10 +58,10 @@ def load_module_from_file_location(
         If location parameter is of a bytes type, then use this encoding
         to decode it into string.
     :param args:
-        Coresponds to the rest of importlib.util.spec_from_file_location
+        Corresponds to the rest of importlib.util.spec_from_file_location
         parameters.
     :param kwargs:
-        Coresponds to the rest of importlib.util.spec_from_file_location
+        Corresponds to the rest of importlib.util.spec_from_file_location
         parameters.
 
     For example You can:
@@ -75,7 +75,6 @@ def load_module_from_file_location(
         location = location.decode(encoding)
 
     if isinstance(location, Path) or "/" in location or "$" in location:
-
         if not isinstance(location, Path):
             # A) Check if location contains any environment variables
             #    in format ${some_env_var}.
@@ -118,7 +117,7 @@ def load_module_from_file_location(
                         compile(config_file.read(), location, "exec"),
                         module.__dict__,
                     )
-            except IOError as e:
+            except OSError as e:
                 e.strerror = "Unable to load configuration file (e.strerror)"
                 raise
             except Exception as e:
@@ -129,4 +128,4 @@ def load_module_from_file_location(
         try:
             return import_string(location)
         except ValueError:
-            raise IOError("Unable to load configuration %s" % str(location))
+            raise OSError("Unable to load configuration %s" % str(location))

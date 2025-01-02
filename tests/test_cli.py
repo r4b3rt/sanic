@@ -1,54 +1,99 @@
 import json
-import subprocess
+import os
+import sys
 
 from pathlib import Path
+from typing import Optional
+from unittest.mock import patch
 
 import pytest
 
 from sanic_routing import __version__ as __routing_version__
 
 from sanic import __version__
+from sanic.__main__ import main
+from sanic.cli.inspector_client import InspectorClient
+
+from .conftest import get_port
 
 
-def capture(command):
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=Path(__file__).parent,
-    )
+@pytest.fixture(scope="module", autouse=True)
+def tty():
+    orig = sys.stdout.isatty
+    sys.stdout.isatty = lambda: False
+    yield
+    sys.stdout.isatty = orig
+
+
+def capture(command: list[str], caplog=None, capsys=None):
+    if capsys:
+        capsys.readouterr()
+    if caplog:
+        caplog.clear()
+    os.chdir(Path(__file__).parent)
     try:
-        out, err = proc.communicate(timeout=1)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, err = proc.communicate()
-    return out, err, proc.returncode
+        main(command)
+    except SystemExit:
+        ...
+    if capsys:
+        captured_err = capsys.readouterr()
+        return captured_err
+    if caplog:
+        return [record.message for record in caplog.records]
+    return None
 
 
-def starting_line(lines):
-    for idx, line in enumerate(lines):
-        if line.strip().startswith(b"Sanic v"):
-            return idx
-    return 0
+def read_app_info(lines: list[str]):
+    for line in lines:
+        if line.startswith("{") and line.endswith("}"):  # type: ignore
+            return json.loads(line)
 
 
 @pytest.mark.parametrize(
-    "appname",
+    "appname,extra",
     (
-        "fake.server.app",
-        "fake.server:app",
-        "fake.server:create_app()",
-        "fake.server.create_app()",
+        ("fake.server.app", None),
+        ("fake.server", None),
+        ("fake.server:create_app", "--factory"),
+        ("fake.server.create_app()", None),
+        ("fake.server.create_app", None),
     ),
 )
-def test_server_run(appname):
-    command = ["sanic", appname]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-    firstline = lines[starting_line(lines) + 1]
+def test_server_run(
+    appname: str, extra: Optional[str], caplog: pytest.LogCaptureFixture, port
+):
+    command = [appname, f"-p={port}"]
+    if extra:
+        command.append(extra)
+    lines = capture(command, caplog)
 
-    assert exitcode != 1
-    assert firstline == b"Goin' Fast @ http://127.0.0.1:8000"
+    assert f"Goin' Fast @ http://127.0.0.1:{port}" in lines
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ["fake.server.create_app_with_args", "--factory"],
+        ["fake.server.create_app_with_args"],
+    ),
+)
+def test_server_run_factory_with_args(caplog, command, port):
+    command.append(f"-p={port}")
+    lines = capture(command, caplog)
+
+    assert "target=fake.server.create_app_with_args" in lines
+
+
+def test_server_run_factory_with_args_arbitrary(caplog, port):
+    command = [
+        "fake.server.create_app_with_args",
+        "--factory",
+        "--foo=bar",
+        f"-p={port}",
+    ]
+    lines = capture(command, caplog)
+
+    assert "foo=bar" in lines
 
 
 @pytest.mark.parametrize(
@@ -69,13 +114,16 @@ def test_server_run(appname):
         ),
     ),
 )
-def test_tls_options(cmd):
-    command = ["sanic", "fake.server.app", *cmd, "-p=9999", "--debug"]
-    out, err, exitcode = capture(command)
-    assert exitcode != 1
-    lines = out.split(b"\n")
-    firstline = lines[starting_line(lines) + 1]
-    assert firstline == b"Goin' Fast @ https://127.0.0.1:9999"
+def test_tls_options(cmd: tuple[str, ...], caplog, port):
+    command = [
+        "fake.server.app",
+        *cmd,
+        f"--port={port}",
+        "--debug",
+        "--single-process",
+    ]
+    lines = capture(command, caplog)
+    assert f"Goin' Fast @ https://127.0.0.1:{port}" in lines
 
 
 @pytest.mark.parametrize(
@@ -90,83 +138,65 @@ def test_tls_options(cmd):
         ("--tls-strict-host",),
     ),
 )
-def test_tls_wrong_options(cmd):
-    command = ["sanic", "fake.server.app", *cmd, "-p=9999", "--debug"]
-    out, err, exitcode = capture(command)
-    assert exitcode == 1
-    assert not out
-    lines = err.decode().split("\n")
+def test_tls_wrong_options(cmd: tuple[str, ...], caplog, port):
+    command = ["fake.server.app", *cmd, f"-p={port}", "--debug"]
+    lines = capture(command, caplog)
 
-    errmsg = lines[8]
-    assert errmsg == "TLS certificates must be specified by either of:"
-
-
-@pytest.mark.parametrize(
-    "cmd",
-    (
-        ("--host=localhost", "--port=9999"),
-        ("-H", "localhost", "-p", "9999"),
-    ),
-)
-def test_host_port_localhost(cmd):
-    command = ["sanic", "fake.server.app", *cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-    firstline = lines[starting_line(lines) + 1]
-
-    assert exitcode != 1
-    assert firstline == b"Goin' Fast @ http://localhost:9999"
+    assert (
+        "TLS certificates must be specified by either of:\n  "
+        "--cert certdir/fullchain.pem --key certdir/privkey.pem\n  "
+        "--tls certdir  (equivalent to the above)"
+    ) in lines
 
 
 @pytest.mark.parametrize(
     "cmd",
     (
-        ("--host=127.0.0.127", "--port=9999"),
-        ("-H", "127.0.0.127", "-p", "9999"),
+        ("--host=localhost", "--port={port}"),
+        ("-H", "localhost", "-p", "{port}"),
     ),
 )
-def test_host_port_ipv4(cmd):
-    command = ["sanic", "fake.server.app", *cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-    firstline = lines[starting_line(lines) + 1]
+def test_host_port_localhost(cmd: tuple[str, ...], caplog, port):
+    cmd = [c.format(port=str(port)) for c in cmd]
+    command = ["fake.server.app", *cmd]
+    lines = capture(command, caplog)
+    expected = f"Goin' Fast @ http://localhost:{port}"
 
-    assert exitcode != 1
-    assert firstline == b"Goin' Fast @ http://127.0.0.127:9999"
+    assert expected in lines
 
 
 @pytest.mark.parametrize(
-    "cmd",
+    "cmd,expected",
     (
-        ("--host=::", "--port=9999"),
-        ("-H", "::", "-p", "9999"),
+        (
+            ("--host=localhost", "--port={port}"),
+            "Goin' Fast @ http://localhost:{port}",
+        ),
+        (
+            ("-H", "localhost", "-p", "{port}"),
+            "Goin' Fast @ http://localhost:{port}",
+        ),
+        (
+            ("--host=127.0.0.1", "--port={port}"),
+            "Goin' Fast @ http://127.0.0.1:{port}",
+        ),
+        (
+            ("-H", "127.0.0.1", "-p", "{port}"),
+            "Goin' Fast @ http://127.0.0.1:{port}",
+        ),
+        (("--host=::", "--port={port}"), "Goin' Fast @ http://[::]:{port}"),
+        (("-H", "::", "-p", "{port}"), "Goin' Fast @ http://[::]:{port}"),
+        (("--host=::1", "--port={port}"), "Goin' Fast @ http://[::1]:{port}"),
+        (("-H", "::1", "-p", "{port}"), "Goin' Fast @ http://[::1]:{port}"),
     ),
 )
-def test_host_port_ipv6_any(cmd):
-    command = ["sanic", "fake.server.app", *cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-    firstline = lines[starting_line(lines) + 1]
+def test_host_port(cmd: tuple[str, ...], expected: str, caplog, port):
+    cmd = [c.format(port=str(port)) for c in cmd]
+    expected = expected.format(port=str(port))
+    command = ["fake.server.app", *cmd]
+    lines = capture(command, caplog)
 
-    assert exitcode != 1
-    assert firstline == b"Goin' Fast @ http://[::]:9999"
-
-
-@pytest.mark.parametrize(
-    "cmd",
-    (
-        ("--host=::1", "--port=9999"),
-        ("-H", "::1", "-p", "9999"),
-    ),
-)
-def test_host_port_ipv6_loopback(cmd):
-    command = ["sanic", "fake.server.app", *cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-    firstline = lines[starting_line(lines) + 1]
-
-    assert exitcode != 1
-    assert firstline == b"Goin' Fast @ http://[::1]:9999"
+    assert expected in lines
 
 
 @pytest.mark.parametrize(
@@ -180,67 +210,80 @@ def test_host_port_ipv6_loopback(cmd):
         (4, ("-w", "4")),
     ),
 )
-def test_num_workers(num, cmd):
-    command = ["sanic", "fake.server.app", *cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
+def test_num_workers(num: int, cmd: tuple[str, ...], caplog, port):
+    command = ["fake.server.app", *cmd, f"-p={port}"]
+    lines = capture(command, caplog)
 
-    worker_lines = [
-        line
-        for line in lines
-        if b"Starting worker" in line or b"Stopping worker" in line
-    ]
-    assert exitcode != 1
-    assert len(worker_lines) == num * 2, f"Lines found: {lines}"
+    if num == 1:
+        expected = "mode: production, single worker"
+    else:
+        expected = f"mode: production, w/ {num} workers"
+
+    assert expected in lines
 
 
-@pytest.mark.parametrize("cmd", ("--debug", "-d"))
-def test_debug(cmd):
-    command = ["sanic", "fake.server.app", cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
+@pytest.mark.parametrize("cmd", ("--debug",))
+def test_debug(cmd: str, caplog, port):
+    command = ["fake.server.app", cmd, f"-p={port}"]
+    lines = capture(command, caplog)
+    info = read_app_info(lines)
 
-    app_info = lines[starting_line(lines) + 9]
-    info = json.loads(app_info)
+    assert info["debug"] is True
+    assert info["auto_reload"] is False
+
+
+@pytest.mark.parametrize("cmd", ("--dev", "-d"))
+def test_dev(cmd: str, caplog, port):
+    command = ["fake.server.app", cmd, f"-p={port}"]
+    lines = capture(command, caplog)
+    info = read_app_info(lines)
 
     assert info["debug"] is True
     assert info["auto_reload"] is True
 
 
 @pytest.mark.parametrize("cmd", ("--auto-reload", "-r"))
-def test_auto_reload(cmd):
-    command = ["sanic", "fake.server.app", cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
+def test_auto_reload(cmd: str, caplog, port):
+    command = ["fake.server.app", cmd, f"-p={port}"]
+    lines = capture(command, caplog)
+    info = read_app_info(lines)
 
-    app_info = lines[starting_line(lines) + 9]
-    info = json.loads(app_info)
-
-    assert info["debug"] is False
-    assert info["auto_reload"] is True
+    assert info["debug"] is False, f"Unexpected value of debug {info}"
+    assert (
+        info["auto_reload"] is True
+    ), f"Unexpected value of auto reload {info}"
 
 
 @pytest.mark.parametrize(
-    "cmd,expected", (("--access-log", True), ("--no-access-log", False))
+    "cmd,expected",
+    (
+        ("", False),
+        ("--debug", True),
+        ("--access-log", True),
+        ("--no-access-log", False),
+    ),
 )
-def test_access_logs(cmd, expected):
-    command = ["sanic", "fake.server.app", cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-
-    app_info = lines[starting_line(lines) + 8]
-    info = json.loads(app_info)
-
-    assert info["access_log"] is expected
+def test_access_logs(cmd: str, expected: bool, caplog, port):
+    command = ["fake.server.app", f"-p={port}"]
+    if cmd:
+        command.append(cmd)
+    lines = capture(command, caplog)
+    print(lines)
+    info = read_app_info(lines)
+    if info["access_log"] != expected:
+        print(lines)
+    assert (
+        info["access_log"] is expected
+    ), f"Expected: {expected}. Received: {info}. Lines: {lines}"
 
 
 @pytest.mark.parametrize("cmd", ("--version", "-v"))
-def test_version(cmd):
-    command = ["sanic", cmd]
-    out, err, exitcode = capture(command)
+def test_version(cmd: str, caplog, capsys):
+    command = [cmd]
+    capture(command, caplog)
     version_string = f"Sanic {__version__}; Routing {__routing_version__}\n"
-
-    assert out == version_string.encode("utf-8")
+    out, _ = capsys.readouterr()
+    assert version_string == out
 
 
 @pytest.mark.parametrize(
@@ -250,12 +293,114 @@ def test_version(cmd):
         ("--no-noisy-exceptions", False),
     ),
 )
-def test_noisy_exceptions(cmd, expected):
-    command = ["sanic", "fake.server.app", cmd]
-    out, err, exitcode = capture(command)
-    lines = out.split(b"\n")
-
-    app_info = lines[starting_line(lines) + 8]
-    info = json.loads(app_info)
+def test_noisy_exceptions(cmd: str, expected: bool, caplog, port):
+    command = ["fake.server.app", cmd, f"-p={port}"]
+    lines = capture(command, caplog)
+    info = read_app_info(lines)
 
     assert info["noisy_exceptions"] is expected
+
+
+def test_inspector_inspect(urlopen, caplog, capsys):
+    urlopen.read.return_value = json.dumps(
+        {
+            "result": {
+                "info": {
+                    "packages": ["foo"],
+                },
+                "extra": {
+                    "more": "data",
+                },
+                "workers": {"Worker-Name": {"some": "state"}},
+            }
+        }
+    ).encode()
+    with patch("sys.argv", ["sanic", "inspect"]):
+        capture(["inspect"], caplog)
+    captured = capsys.readouterr()
+    assert "Inspecting @ http://localhost:6457" in captured.out
+    assert "Worker-Name" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "command,params",
+    (
+        (["reload"], {"zero_downtime": False}),
+        (["reload", "--zero-downtime"], {"zero_downtime": True}),
+        (["shutdown"], {}),
+        (["scale", "9"], {"replicas": 9}),
+        (["foo", "--bar=something"], {"bar": "something"}),
+        (["foo", "--bar"], {"bar": True}),
+        (["foo", "--no-bar"], {"bar": False}),
+        (["foo", "positional"], {"args": ["positional"]}),
+        (
+            ["foo", "positional", "--bar=something"],
+            {"args": ["positional"], "bar": "something"},
+        ),
+    ),
+)
+def test_inspector_command(command, params):
+    with patch.object(InspectorClient, "request") as client:
+        with patch("sys.argv", ["sanic", "inspect", *command]):
+            main()
+
+    client.assert_called_once_with(command[0], **params)
+
+
+def test_server_run_with_repl(caplog, capsys):
+    record = (
+        "sanic.error",
+        40,
+        "Can't start REPL in non-interactive mode. "
+        "You can only run with --repl in a TTY.",
+    )
+
+    def run():
+        command = ["fake.server.app", "--repl", f"-p={get_port()}"]
+        return capture(command, capsys=capsys)
+
+    with patch("sanic.cli.app.is_atty", return_value=True):
+        result = run()
+
+    assert record not in caplog.record_tuples
+    assert "Welcome to the Sanic interactive console" in result.err
+    assert ">>> " in result.out
+
+    run()
+    assert record in caplog.record_tuples
+
+
+def test_command_no_args(caplog):
+    args = ["fake.server.app", "exec", "foo"]
+    with patch("sys.argv", ["sanic", *args]):
+        lines = capture(args, caplog)
+    assert "FOO one=None two=None three='...'" in lines
+
+
+def test_command_with_args(caplog):
+    args = [
+        "fake.server.app",
+        "exec",
+        "foo",
+        "--one=1",
+        "--two=2",
+        "--three=3",
+    ]
+    with patch("sys.argv", ["sanic", *args]):
+        lines = capture(args, caplog)
+    assert "FOO one='1' two='2' three='3'" in lines
+
+
+def test_command_with_sync_handler(caplog):
+    args = ["fake.server.app", "exec", "bar"]
+    with patch("sys.argv", ["sanic", *args]):
+        lines = capture(args, caplog)
+    assert "BAR" in lines
+
+
+def test_command_with_renamed_command(caplog):
+    args = ["fake.server.app", "exec", "qqq"]
+    with patch("sys.argv", ["sanic", *args]):
+        lines = capture(args, caplog)
+    assert "BAZ" in lines

@@ -1,3 +1,4 @@
+import base64
 import logging
 
 from json import dumps as json_dumps
@@ -15,9 +16,14 @@ from sanic_testing.testing import (
 )
 
 from sanic import Blueprint, Sanic
+from sanic.constants import DEFAULT_HTTP_CONTENT_TYPE
 from sanic.exceptions import ServerError
-from sanic.request import DEFAULT_HTTP_CONTENT_TYPE, RequestParameters
-from sanic.response import html, json, text
+from sanic.request import RequestParameters
+from sanic.response import BaseHTTPResponse, html, json, text
+
+
+def encode_basic_auth_credentials(username, password):
+    return base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
 
 
 # ------------------------------------------------------------ #
@@ -99,11 +105,11 @@ def test_html(app):
         return html("<h1>Hello</h1>")
 
     @app.route("/foo")
-    async def handler(request):
+    async def handler_foo(request):
         return html(Foo())
 
     @app.route("/bar")
-    async def handler(request):
+    async def handler_bar(request):
         return html(Bar())
 
     request, response = app.test_client.get("/")
@@ -362,93 +368,95 @@ async def test_uri_template_asgi(app):
     assert request.uri_template == "/foo/<id:int>/bar/<name:[A-z]+>"
 
 
-def test_token(app):
+@pytest.mark.parametrize(
+    ("auth_type", "token"),
+    [
+        # uuid4 generated token set in "Authorization" header
+        (None, "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"),
+        # uuid4 generated token with API Token authorization
+        ("Token", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"),
+        # uuid4 generated token with Bearer Token authorization
+        ("Bearer", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"),
+        # no Authorization header
+        (None, None),
+    ],
+)
+def test_token(app, auth_type, token):
     @app.route("/")
     async def handler(request):
         return text("OK")
 
-    # uuid4 generated token.
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"{token}",
-    }
+    if token:
+        headers = {
+            "content-type": "application/json",
+            "Authorization": f"{auth_type} {token}"
+            if auth_type
+            else f"{token}",
+        }
+    else:
+        headers = {"content-type": "application/json"}
 
     request, response = app.test_client.get("/", headers=headers)
-
     assert request.token == token
 
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Token {token}",
-    }
 
-    request, response = app.test_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    request, response = app.test_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    # no Authorization headers
-    headers = {"content-type": "application/json"}
-
-    request, response = app.test_client.get("/", headers=headers)
-
-    assert request.token is None
-
-
-@pytest.mark.asyncio
-async def test_token_asgi(app):
+@pytest.mark.parametrize(
+    ("auth_type", "token", "username", "password"),
+    [
+        # uuid4 generated token set in "Authorization" header
+        (None, "a1d895e0-553a-421a-8e22-5ff8ecb48cbf", None, None),
+        # uuid4 generated token with API Token authorization
+        ("Token", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf", None, None),
+        # uuid4 generated token with Bearer Token authorization
+        ("Bearer", "a1d895e0-553a-421a-8e22-5ff8ecb48cbf", None, None),
+        # username and password with Basic Auth authorization
+        (
+            "Basic",
+            encode_basic_auth_credentials("some_username", "some_pass"),
+            "some_username",
+            "some_pass",
+        ),
+        # no Authorization header
+        (None, None, None, None),
+    ],
+)
+def test_credentials(app, capfd, auth_type, token, username, password):
     @app.route("/")
     async def handler(request):
         return text("OK")
 
-    # uuid4 generated token.
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"{token}",
-    }
+    if token:
+        headers = {
+            "content-type": "application/json",
+            "Authorization": f"{auth_type} {token}"
+            if auth_type
+            else f"{token}",
+        }
+    else:
+        headers = {"content-type": "application/json"}
 
-    request, response = await app.asgi_client.get("/", headers=headers)
+    request, response = app.test_client.get("/", headers=headers)
 
-    assert request.token == token
+    if auth_type == "Basic":
+        assert request.credentials.username == username
+        assert request.credentials.password == password
+    else:
+        _, err = capfd.readouterr()
+        with pytest.raises(AttributeError):
+            request.credentials.password
+            assert "Password is available for Basic Auth only" in err
+            request.credentials.username
+            assert "Username is available for Basic Auth only" in err
 
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Token {token}",
-    }
-
-    request, response = await app.asgi_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    token = "a1d895e0-553a-421a-8e22-5ff8ecb48cbf"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    request, response = await app.asgi_client.get("/", headers=headers)
-
-    assert request.token == token
-
-    # no Authorization headers
-    headers = {"content-type": "application/json"}
-
-    request, response = await app.asgi_client.get("/", headers=headers)
-
-    assert request.token is None
+    if token:
+        assert request.credentials.token == token
+        assert request.credentials.auth_type == auth_type
+    else:
+        assert request.credentials is None
+        assert not hasattr(request.credentials, "token")
+        assert not hasattr(request.credentials, "auth_type")
+        assert not hasattr(request.credentials, "_username")
+        assert not hasattr(request.credentials, "_password")
 
 
 def test_content_type(app):
@@ -493,7 +501,8 @@ def test_standard_forwarded(app):
     headers = {
         "Forwarded": (
             'for=1.1.1.1, for=injected;host="'
-            ', for="[::2]";proto=https;host=me.tld;path="/app/";secret=mySecret'
+            ', for="[::2]";proto=https;host=me.tld;'
+            'path="/app/";secret=mySecret'
             ",for=broken;;secret=b0rked"
             ", for=127.0.0.3;scheme=http;port=1234"
         ),
@@ -505,6 +514,7 @@ def test_standard_forwarded(app):
     request, response = app.test_client.get("/", headers=headers)
     assert response.json == {"for": "127.0.0.2", "proto": "ws"}
     assert request.remote_addr == "127.0.0.2"
+    assert request.client_ip == "127.0.0.2"
     assert request.scheme == "ws"
     assert request.server_name == "local.site"
     assert request.server_port == 80
@@ -607,7 +617,8 @@ async def test_standard_forwarded_asgi(app):
     headers = {
         "Forwarded": (
             'for=1.1.1.1, for=injected;host="'
-            ', for="[::2]";proto=https;host=me.tld;path="/app/";secret=mySecret'
+            ', for="[::2]";proto=https;host=me.tld;'
+            'path="/app/";secret=mySecret'
             ",for=broken;;secret=b0rked"
             ", for=127.0.0.3;scheme=http;port=1234"
         ),
@@ -729,6 +740,7 @@ def test_remote_addr_with_two_proxies(app):
     headers = {"X-Forwarded-For": "127.0.1.1"}
     request, response = app.test_client.get("/", headers=headers)
     assert request.remote_addr == ""
+    assert request.client_ip == "127.0.0.1"
     assert response.body == b""
 
     headers = {"X-Forwarded-For": "127.0.0.1, 127.0.1.2"}
@@ -1009,6 +1021,72 @@ async def test_post_form_urlencoded_asgi(app):
     assert request.form.get("test") == "OK"  # For request.parsed_form
 
 
+def test_post_form_urlencoded_keep_blanks(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        request.get_form(keep_blank_values=True)
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = app.test_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert request.form.get("test") == ""
+    assert request.form.get("test") == ""  # For request.parsed_form
+
+
+@pytest.mark.asyncio
+async def test_post_form_urlencoded_keep_blanks_asgi(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        request.get_form(keep_blank_values=True)
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = await app.asgi_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert request.form.get("test") == ""
+    assert request.form.get("test") == ""  # For request.parsed_form
+
+
+def test_post_form_urlencoded_drop_blanks(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = app.test_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert "test" not in request.form.keys()
+
+
+@pytest.mark.asyncio
+async def test_post_form_urlencoded_drop_blanks_asgi(app):
+    @app.route("/", methods=["POST"])
+    async def handler(request):
+        return text("OK")
+
+    payload = "test="
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+
+    request, response = await app.asgi_client.post(
+        "/", data=payload, headers=headers
+    )
+
+    assert "test" not in request.form.keys()
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1174,7 +1252,8 @@ async def test_request_string_representation_asgi(app):
     [
         (
             "------sanic\r\n"
-            'Content-Disposition: form-data; filename="filename"; name="test"\r\n'
+            'Content-Disposition: form-data; filename="filename"'
+            '; name="test"\r\n'
             "\r\n"
             "OK\r\n"
             "------sanic--\r\n",
@@ -1182,7 +1261,8 @@ async def test_request_string_representation_asgi(app):
         ),
         (
             "------sanic\r\n"
-            'content-disposition: form-data; filename="filename"; name="test"\r\n'
+            'content-disposition: form-data; filename="filename"'
+            '; name="test"\r\n'
             "\r\n"
             'content-type: application/json; {"field": "value"}\r\n'
             "------sanic--\r\n",
@@ -1206,19 +1286,41 @@ async def test_request_string_representation_asgi(app):
         ),
         (
             "------sanic\r\n"
-            'Content-Disposition: form-data; filename*="utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
+            "Content-Disposition: form-data; filename*="
+            '"utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
             "\r\n"
             "OK\r\n"
             "------sanic--\r\n",
-            "filename_\u00A0_test",
+            "filename_\u00a0_test",
         ),
         (
             "------sanic\r\n"
-            'content-disposition: form-data; filename*="utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
+            "content-disposition: form-data; filename*="
+            '"utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
             "\r\n"
             'content-type: application/json; {"field": "value"}\r\n'
             "------sanic--\r\n",
-            "filename_\u00A0_test",
+            "filename_\u00a0_test",
+        ),
+        # Umlaut using NFC normalization (Windows, Linux, Android)
+        (
+            "------sanic\r\n"
+            "content-disposition: form-data; filename*="
+            '"utf-8\'\'filename_%C3%A4_test"; name="test"\r\n'
+            "\r\n"
+            "OK\r\n"
+            "------sanic--\r\n",
+            "filename_\u00e4_test",
+        ),
+        # Umlaut using NFD normalization (MacOS client)
+        (
+            "------sanic\r\n"
+            "content-disposition: form-data; filename*="
+            '"utf-8\'\'filename_a%CC%88_test"; name="test"\r\n'
+            "\r\n"
+            "OK\r\n"
+            "------sanic--\r\n",
+            "filename_\u00e4_test",  # Sanic should normalize to NFC
         ),
     ],
 )
@@ -1238,7 +1340,8 @@ def test_request_multipart_files(app, payload, filename):
     [
         (
             "------sanic\r\n"
-            'Content-Disposition: form-data; filename="filename"; name="test"\r\n'
+            'Content-Disposition: form-data; filename="filename";'
+            ' name="test"\r\n'
             "\r\n"
             "OK\r\n"
             "------sanic--\r\n",
@@ -1246,7 +1349,8 @@ def test_request_multipart_files(app, payload, filename):
         ),
         (
             "------sanic\r\n"
-            'content-disposition: form-data; filename="filename"; name="test"\r\n'
+            'content-disposition: form-data; filename="filename";'
+            ' name="test"\r\n'
             "\r\n"
             'content-type: application/json; {"field": "value"}\r\n'
             "------sanic--\r\n",
@@ -1270,19 +1374,21 @@ def test_request_multipart_files(app, payload, filename):
         ),
         (
             "------sanic\r\n"
-            'Content-Disposition: form-data; filename*="utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
+            "Content-Disposition: form-data; filename*="
+            '"utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
             "\r\n"
             "OK\r\n"
             "------sanic--\r\n",
-            "filename_\u00A0_test",
+            "filename_\u00a0_test",
         ),
         (
             "------sanic\r\n"
-            'content-disposition: form-data; filename*="utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
+            "content-disposition: form-data; filename*="
+            '"utf-8\'\'filename_%C2%A0_test"; name="test"\r\n'
             "\r\n"
             'content-type: application/json; {"field": "value"}\r\n'
             "------sanic--\r\n",
-            "filename_\u00A0_test",
+            "filename_\u00a0_test",
         ),
     ],
 )
@@ -1305,7 +1411,8 @@ def test_request_multipart_file_with_json_content_type(app):
 
     payload = (
         "------sanic\r\n"
-        'Content-Disposition: form-data; name="file"; filename="test.json"\r\n'
+        'Content-Disposition: form-data; name="file";'
+        ' filename="test.json"\r\n'
         "Content-Type: application/json\r\n"
         "Content-Length: 0"
         "\r\n"
@@ -1327,7 +1434,8 @@ async def test_request_multipart_file_with_json_content_type_asgi(app):
 
     payload = (
         "------sanic\r\n"
-        'Content-Disposition: form-data; name="file"; filename="test.json"\r\n'
+        'Content-Disposition: form-data; name="file";'
+        ' filename="test.json"\r\n'
         "Content-Type: application/json\r\n"
         "Content-Length: 0"
         "\r\n"
@@ -1389,7 +1497,8 @@ def test_request_multipart_file_duplicate_filed_name(app):
     )
 
     headers = {
-        "Content-Type": "multipart/form-data; boundary=e73ffaa8b1b2472b8ec848de833cb05b"
+        "Content-Type": "multipart/form-data;"
+        " boundary=e73ffaa8b1b2472b8ec848de833cb05b"
     }
 
     request, _ = app.test_client.post(
@@ -1424,7 +1533,8 @@ async def test_request_multipart_file_duplicate_filed_name_asgi(app):
     )
 
     headers = {
-        "Content-Type": "multipart/form-data; boundary=e73ffaa8b1b2472b8ec848de833cb05b"
+        "Content-Type": "multipart/form-data;"
+        " boundary=e73ffaa8b1b2472b8ec848de833cb05b"
     }
 
     request, _ = await app.asgi_client.post("/", data=payload, headers=headers)
@@ -1440,9 +1550,11 @@ def test_request_multipart_with_multiple_files_and_type(app):
         return text("OK")
 
     payload = (
-        '------sanic\r\nContent-Disposition: form-data; name="file"; filename="test.json"'
+        '------sanic\r\nContent-Disposition: form-data; name="file";'
+        ' filename="test.json"'
         "\r\nContent-Type: application/json\r\n\r\n\r\n"
-        '------sanic\r\nContent-Disposition: form-data; name="file"; filename="some_file.pdf"\r\n'
+        '------sanic\r\nContent-Disposition: form-data; name="file";'
+        ' filename="some_file.pdf"\r\n'
         "Content-Type: application/pdf\r\n\r\n\r\n------sanic--"
     )
     headers = {"content-type": "multipart/form-data; boundary=------sanic"}
@@ -1460,9 +1572,11 @@ async def test_request_multipart_with_multiple_files_and_type_asgi(app):
         return text("OK")
 
     payload = (
-        '------sanic\r\nContent-Disposition: form-data; name="file"; filename="test.json"'
+        '------sanic\r\nContent-Disposition: form-data; name="file";'
+        ' filename="test.json"'
         "\r\nContent-Type: application/json\r\n\r\n\r\n"
-        '------sanic\r\nContent-Disposition: form-data; name="file"; filename="some_file.pdf"\r\n'
+        '------sanic\r\nContent-Disposition: form-data; name="file";'
+        ' filename="some_file.pdf"\r\n'
         "Content-Type: application/pdf\r\n\r\n\r\n------sanic--"
     )
     headers = {"content-type": "multipart/form-data; boundary=------sanic"}
@@ -1714,7 +1828,6 @@ async def test_request_query_args_custom_parsing_asgi(app):
 
 
 def test_request_cookies(app):
-
     cookies = {"test": "OK"}
 
     @app.get("/")
@@ -1723,13 +1836,12 @@ def test_request_cookies(app):
 
     request, response = app.test_client.get("/", cookies=cookies)
 
-    assert request.cookies == cookies
-    assert request.cookies == cookies  # For request._cookies
+    assert len(request.cookies) == len(cookies)
+    assert request.cookies["test"] == [cookies["test"]]
 
 
 @pytest.mark.asyncio
 async def test_request_cookies_asgi(app):
-
     cookies = {"test": "OK"}
 
     @app.get("/")
@@ -1738,8 +1850,8 @@ async def test_request_cookies_asgi(app):
 
     request, response = await app.asgi_client.get("/", cookies=cookies)
 
-    assert request.cookies == cookies
-    assert request.cookies == cookies  # For request._cookies
+    assert len(request.cookies) == len(cookies)
+    assert request.cookies["test"] == [cookies["test"]]
 
 
 def test_request_cookies_without_cookies(app):
@@ -1919,11 +2031,11 @@ def test_server_name_and_url_for(app):
     app.config.SERVER_NAME = "my-server"  # This means default port
     assert app.url_for("handler", _external=True) == "http://my-server/foo"
     request, response = app.test_client.get("/foo")
-    assert request.url_for("handler") == f"http://my-server/foo"
+    assert request.url_for("handler") == "http://my-server/foo"
 
     app.config.SERVER_NAME = "https://my-server/path"
     request, response = app.test_client.get("/foo")
-    url = f"https://my-server/path/foo"
+    url = "https://my-server/path/foo"
     assert app.url_for("handler", _external=True) == url
     assert request.url_for("handler") == url
 
@@ -1979,7 +2091,7 @@ async def test_request_form_invalid_content_type_asgi(app):
 
 
 def test_endpoint_basic():
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
 
     @app.route("/")
     def my_unique_handler(request):
@@ -1987,12 +2099,12 @@ def test_endpoint_basic():
 
     request, response = app.test_client.get("/")
 
-    assert request.endpoint == "test_requests.my_unique_handler"
+    assert request.endpoint == "Test.my_unique_handler"
 
 
 @pytest.mark.asyncio
 async def test_endpoint_basic_asgi():
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
 
     @app.route("/")
     def my_unique_handler(request):
@@ -2000,7 +2112,7 @@ async def test_endpoint_basic_asgi():
 
     request, response = await app.asgi_client.get("/")
 
-    assert request.endpoint == "test_requests.my_unique_handler"
+    assert request.endpoint == "Test.my_unique_handler"
 
 
 def test_endpoint_named_app():
@@ -2088,7 +2200,7 @@ def test_safe_method_with_body_ignored(app):
     )
 
     assert request.body == b""
-    assert request.json == None
+    assert request.json is None
     assert response.body == b"OK"
 
 
@@ -2109,42 +2221,68 @@ def test_safe_method_with_body(app):
     assert response.body == b"OK"
 
 
-def test_conflicting_body_methods_overload(app):
+@pytest.mark.asyncio
+async def test_conflicting_body_methods_overload_error(app: Sanic):
     @app.put("/")
     @app.put("/p/")
     @app.put("/p/<foo>")
+    async def put(request, foo=None): ...
+
+    with pytest.raises(
+        ServerError,
+        match=(
+            r"Duplicate route names detected:"
+            r" test_conflicting_body_methods_overload_error\.put.*"
+        ),
+    ):
+        await app._startup()
+
+
+def test_conflicting_body_methods_overload(app: Sanic):
+    @app.put("/", name="one")
+    @app.put("/p/", name="two")
+    @app.put("/p/<foo>", name="three")
     async def put(request, foo=None):
         return json(
-            {"name": request.route.name, "body": str(request.body), "foo": foo}
+            {
+                "name": request.route.name,
+                "body": str(request.body).replace(" ", ""),
+                "foo": foo,
+            }
         )
 
     @app.delete("/p/<foo>")
     async def delete(request, foo):
         return json(
-            {"name": request.route.name, "body": str(request.body), "foo": foo}
+            {
+                "name": request.route.name,
+                "body": str(request.body).replace(" ", ""),
+                "foo": foo,
+            }
         )
 
+    dumps = BaseHTTPResponse._dumps
     payload = {"test": "OK"}
-    data = str(json_dumps(payload).encode())
+    data = str(dumps(payload).encode()).replace(" ", "")
 
     _, response = app.test_client.put("/", json=payload)
     assert response.status == 200
     assert response.json == {
-        "name": "test_conflicting_body_methods_overload.put",
+        "name": "test_conflicting_body_methods_overload.one",
         "foo": None,
         "body": data,
     }
     _, response = app.test_client.put("/p", json=payload)
     assert response.status == 200
     assert response.json == {
-        "name": "test_conflicting_body_methods_overload.put",
+        "name": "test_conflicting_body_methods_overload.two",
         "foo": None,
         "body": data,
     }
     _, response = app.test_client.put("/p/test", json=payload)
     assert response.status == 200
     assert response.json == {
-        "name": "test_conflicting_body_methods_overload.put",
+        "name": "test_conflicting_body_methods_overload.three",
         "foo": "test",
         "body": data,
     }
@@ -2153,13 +2291,32 @@ def test_conflicting_body_methods_overload(app):
     assert response.json == {
         "name": "test_conflicting_body_methods_overload.delete",
         "foo": "test",
-        "body": str("".encode()),
+        "body": str(b""),
     }
 
 
-def test_handler_overload(app):
+@pytest.mark.asyncio
+async def test_handler_overload_error(app: Sanic):
     @app.get("/long/sub/route/param_a/<param_a:str>/param_b/<param_b:str>")
     @app.post("/long/sub/route/")
+    def handler(request, **kwargs): ...
+
+    with pytest.raises(
+        ServerError,
+        match=(
+            r"Duplicate route names detected:"
+            r" test_handler_overload_error\.handler.*"
+        ),
+    ):
+        await app._startup()
+
+
+def test_handler_overload(app: Sanic):
+    @app.get(
+        "/long/sub/route/param_a/<param_a:str>/param_b/<param_b:str>",
+        name="one",
+    )
+    @app.post("/long/sub/route/", name="two")
     def handler(request, **kwargs):
         return json(kwargs)
 

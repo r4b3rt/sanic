@@ -8,6 +8,7 @@ Run with xdist params:
 
     $ pytest examples/pytest_xdist.py -n 8  # 8 workers
 """
+
 import re
 
 import pytest
@@ -32,7 +33,7 @@ def test_port(worker_id):
 
 @pytest.fixture(scope="session")
 def app():
-    app = Sanic()
+    app = Sanic("Example")
 
     @app.route("/")
     async def index(request):

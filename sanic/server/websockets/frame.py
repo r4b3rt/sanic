@@ -1,7 +1,8 @@
 import asyncio
 import codecs
 
-from typing import TYPE_CHECKING, AsyncIterator, List, Optional
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Optional
 
 from websockets.frames import Frame, Opcode
 from websockets.typing import Data
@@ -47,20 +48,17 @@ class WebsocketFrameAssembler:
         get_in_progress: bool
         decoder: Optional[codecs.IncrementalDecoder]
         # For streaming chunks rather than messages:
-        chunks: List[Data]
+        chunks: list[Data]
         chunks_queue: Optional[asyncio.Queue[Optional[Data]]]
         paused: bool
 
     def __init__(self, protocol) -> None:
-
         self.protocol = protocol
 
         self.read_mutex = asyncio.Lock()
         self.write_mutex = asyncio.Lock()
 
-        self.completed_queue = asyncio.Queue(
-            maxsize=1
-        )  # type: asyncio.Queue[Data]
+        self.completed_queue = asyncio.Queue(maxsize=1)  # type: asyncio.Queue[Data]
 
         # put() sets this event to tell get() that a message can be fetched.
         self.message_complete = asyncio.Event()
@@ -97,6 +95,7 @@ class WebsocketFrameAssembler:
         If ``timeout`` is set and elapses before a complete message is
         received, :meth:`get` returns ``None``.
         """
+        completed: bool
         async with self.read_mutex:
             if timeout is not None and timeout <= 0:
                 if not self.message_complete.is_set():
@@ -131,7 +130,7 @@ class WebsocketFrameAssembler:
             if self.paused:
                 self.protocol.resume_frames()
                 self.paused = False
-            if not self.get_in_progress:
+            if not self.get_in_progress:  # no cov
                 # This should be guarded against with the read_mutex,
                 # exception is here as a failsafe
                 raise ServerError(
@@ -204,7 +203,7 @@ class WebsocketFrameAssembler:
             if self.paused:
                 self.protocol.resume_frames()
                 self.paused = False
-            if not self.get_in_progress:
+            if not self.get_in_progress:  # no cov
                 # This should be guarded against with the read_mutex,
                 # exception is here as a failsafe
                 raise ServerError(
@@ -212,7 +211,7 @@ class WebsocketFrameAssembler:
                     "asynchronous get was in progress."
                 )
             self.get_in_progress = False
-            if not self.message_complete.is_set():
+            if not self.message_complete.is_set():  # no cov
                 # This should be guarded against with the read_mutex,
                 # exception is here as a failsafe
                 raise ServerError(
@@ -220,7 +219,7 @@ class WebsocketFrameAssembler:
                     "message was complete."
                 )
             self.message_complete.clear()
-            if self.message_fetched.is_set():
+            if self.message_fetched.is_set():  # no cov
                 # This should be guarded against with the read_mutex,
                 # and get_in_progress check, this exception is
                 # here as a failsafe

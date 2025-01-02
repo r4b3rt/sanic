@@ -1,5 +1,6 @@
 import logging
-import warnings
+
+from itertools import count
 
 import pytest
 
@@ -7,22 +8,28 @@ from bs4 import BeautifulSoup
 
 from sanic import Sanic
 from sanic.exceptions import (
+    BadRequest,
+    ContentRangeError,
+    ExpectationFailed,
     Forbidden,
+    HeaderExpectationFailed,
     InvalidUsage,
+    MethodNotAllowed,
+    MethodNotSupported,
     NotFound,
+    RangeNotSatisfiable,
     SanicException,
     ServerError,
     Unauthorized,
-    abort,
 )
 from sanic.response import text
 
 
-def dl_to_dict(soup, css_class):
+def dl_to_dict(soup, dl_id):
     keys, values = [], []
-    for dl in soup.find_all("dl", {"class": css_class}):
+    for dl in soup.find_all("dl", {"id": dl_id}):
         for dt in dl.find_all("dt"):
-            keys.append(dt.text.strip())
+            keys.append(dt.text.split(":", 1)[0])
         for dd in dl.find_all("dd"):
             values.append(dd.text.strip())
     return dict(zip(keys, values))
@@ -35,6 +42,7 @@ class SanicExceptionTestException(Exception):
 @pytest.fixture(scope="module")
 def exception_app():
     app = Sanic("test_exceptions")
+    app.config.FALLBACK_ERROR_FORMAT = "html"
 
     @app.route("/")
     def handler(request):
@@ -78,7 +86,7 @@ def exception_app():
 
     @app.route("/invalid")
     def handler_invalid(request):
-        raise InvalidUsage("OK")
+        raise BadRequest("OK")
 
     @app.route("/abort/401")
     def handler_401_error(request):
@@ -87,10 +95,6 @@ def exception_app():
     @app.route("/abort")
     def handler_500_error(request):
         raise SanicException(status_code=500)
-
-    @app.route("/old_abort")
-    def handler_old_abort_error(request):
-        abort(500)
 
     @app.route("/abort/message")
     def handler_abort_message(request):
@@ -141,7 +145,7 @@ def test_server_error_exception(exception_app):
 
 
 def test_invalid_usage_exception(exception_app):
-    """Test the built-in InvalidUsage exception works"""
+    """Test the built-in BadRequest exception works"""
     request, response = exception_app.test_client.get("/invalid")
     assert response.status == 400
 
@@ -192,10 +196,7 @@ def test_handled_unhandled_exception(exception_app):
     assert "Internal Server Error" in soup.h1.text
 
     message = " ".join(soup.p.text.split())
-    assert message == (
-        "The server encountered an internal error and "
-        "cannot complete your request."
-    )
+    assert "The application encountered an unexpected error" in message
 
 
 def test_exception_in_exception_handler(exception_app):
@@ -239,11 +240,6 @@ def test_sanic_exception(exception_app):
     assert response.status == 500
     assert "Custom Message" in response.text
 
-    with warnings.catch_warnings(record=True) as w:
-        request, response = exception_app.test_client.get("/old_abort")
-    assert response.status == 500
-    assert len(w) == 1 and "deprecated" in w[0].message.args[0]
-
 
 def test_custom_exception_default_message(exception_app):
     class TeaError(SanicException):
@@ -262,7 +258,7 @@ def test_custom_exception_default_message(exception_app):
 
 
 def test_exception_in_ws_logged(caplog):
-    app = Sanic(__file__)
+    app = Sanic("Test")
 
     @app.websocket("/feed")
     async def feed(request, ws):
@@ -271,14 +267,18 @@ def test_exception_in_ws_logged(caplog):
     with caplog.at_level(logging.INFO):
         app.test_client.websocket("/feed")
 
-    error_logs = [r for r in caplog.record_tuples if r[0] == "sanic.error"]
-    assert error_logs[1][1] == logging.ERROR
-    assert "Exception occurred while handling uri:" in error_logs[1][2]
+    for record in caplog.record_tuples:
+        if record[2].startswith("Exception occurred"):
+            break
+
+    assert record[0] == "sanic.error"
+    assert record[1] == logging.ERROR
+    assert "Exception occurred while handling uri:" in record[2]
 
 
 @pytest.mark.parametrize("debug", (True, False))
 def test_contextual_exception_context(debug):
-    app = Sanic(__name__)
+    app = Sanic("Test")
 
     class TeapotError(SanicException):
         status_code = 418
@@ -287,9 +287,15 @@ def test_contextual_exception_context(debug):
     def fail():
         raise TeapotError(context={"foo": "bar"})
 
-    app.post("/coffee/json", error_format="json")(lambda _: fail())
-    app.post("/coffee/html", error_format="html")(lambda _: fail())
-    app.post("/coffee/text", error_format="text")(lambda _: fail())
+    app.post("/coffee/json", error_format="json", name="json")(
+        lambda _: fail()
+    )
+    app.post("/coffee/html", error_format="html", name="html")(
+        lambda _: fail()
+    )
+    app.post("/coffee/text", error_format="text", name="text")(
+        lambda _: fail()
+    )
 
     _, response = app.test_client.post("/coffee/json", debug=debug)
     assert response.status == 418
@@ -298,7 +304,7 @@ def test_contextual_exception_context(debug):
 
     _, response = app.test_client.post("/coffee/html", debug=debug)
     soup = BeautifulSoup(response.body, "html.parser")
-    dl = dl_to_dict(soup, "context")
+    dl = dl_to_dict(soup, "exception-context")
     assert response.status == 418
     assert "Sorry, I cannot brew coffee" in soup.find("p").text
     assert dl == {"foo": "bar"}
@@ -313,7 +319,7 @@ def test_contextual_exception_context(debug):
 
 @pytest.mark.parametrize("debug", (True, False))
 def test_contextual_exception_extra(debug):
-    app = Sanic(__name__)
+    app = Sanic("Test")
 
     class TeapotError(SanicException):
         status_code = 418
@@ -325,9 +331,15 @@ def test_contextual_exception_extra(debug):
     def fail():
         raise TeapotError(extra={"foo": "bar"})
 
-    app.post("/coffee/json", error_format="json")(lambda _: fail())
-    app.post("/coffee/html", error_format="html")(lambda _: fail())
-    app.post("/coffee/text", error_format="text")(lambda _: fail())
+    app.post("/coffee/json", error_format="json", name="json")(
+        lambda _: fail()
+    )
+    app.post("/coffee/html", error_format="html", name="html")(
+        lambda _: fail()
+    )
+    app.post("/coffee/text", error_format="text", name="text")(
+        lambda _: fail()
+    )
 
     _, response = app.test_client.post("/coffee/json", debug=debug)
     assert response.status == 418
@@ -339,7 +351,7 @@ def test_contextual_exception_extra(debug):
 
     _, response = app.test_client.post("/coffee/html", debug=debug)
     soup = BeautifulSoup(response.body, "html.parser")
-    dl = dl_to_dict(soup, "extra")
+    dl = dl_to_dict(soup, "exception-extra")
     assert response.status == 418
     assert "Found bar" in soup.find("p").text
     if debug:
@@ -360,7 +372,7 @@ def test_contextual_exception_extra(debug):
 
 @pytest.mark.parametrize("override", (True, False))
 def test_contextual_exception_functional_message(override):
-    app = Sanic(__name__)
+    app = Sanic("Test")
 
     class TeapotError(SanicException):
         status_code = 418
@@ -381,3 +393,58 @@ def test_contextual_exception_functional_message(override):
     assert response.status == 418
     assert response.json["message"] == error_message
     assert response.json["context"] == {"foo": "bar"}
+
+
+def test_exception_aliases():
+    assert InvalidUsage is BadRequest
+    assert MethodNotSupported is MethodNotAllowed
+    assert ContentRangeError is RangeNotSatisfiable
+    assert HeaderExpectationFailed is ExpectationFailed
+
+
+def test_exception_message_attribute():
+    assert ServerError("it failed").message == "it failed"
+    assert ServerError(b"it failed").message == "it failed"
+    assert (
+        ServerError().message == str(ServerError()) == "Internal Server Error"
+    )
+
+    class CustomError(SanicException):
+        message = "Something bad happened"
+
+    assert CustomError().message == CustomError.message == str(CustomError())
+    assert SanicException().message != ""
+    assert SanicException("").message == ""
+
+
+def test_exception_quiet_attribute():
+    class SilentException(SanicException):
+        quiet = True
+
+    class NoisyException(SanicException):
+        quiet = False
+
+    assert SilentException().quiet
+    assert not NoisyException().quiet
+    assert SilentException(quiet=True).quiet
+    assert NoisyException(quiet=True).quiet
+    assert not SilentException(quiet=False).quiet
+    assert not NoisyException(quiet=False).quiet
+
+
+def test_request_middleware_exception_on_404(app: Sanic):
+    """See https://github.com/sanic-org/sanic/issues/2950"""
+    counter = count()
+
+    @app.on_request
+    def request_middleware(request):
+        next(counter)
+        raise Exception
+
+    @app.route("/")
+    async def handler(request): ...
+
+    _, response = app.test_client.get("/not-found")
+
+    assert response.status == 500
+    assert next(counter) == 1

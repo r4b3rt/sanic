@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser, _ArgumentGroup
-from typing import List, Optional, Type, Union
+from typing import Optional, Union
 
-from sanic_routing import __version__ as __routing_version__  # type: ignore
+from sanic_routing import __version__ as __routing_version__
 
 from sanic import __version__
+from sanic.http.constants import HTTP
 
 
 class Group:
     name: Optional[str]
     container: Union[ArgumentParser, _ArgumentGroup]
-    _registry: List[Type[Group]] = []
+    _registry: list[type[Group]] = []
 
     def __init_subclass__(cls) -> None:
         Group._registry.append(cls)
@@ -29,7 +30,7 @@ class Group:
         instance = cls(parser, cls.name)
         return instance
 
-    def add_bool_arguments(self, *args, **kwargs):
+    def add_bool_arguments(self, *args, nullable=False, **kwargs):
         group = self.container.add_mutually_exclusive_group()
         kwargs["help"] = kwargs["help"].capitalize()
         group.add_argument(*args, action="store_true", **kwargs)
@@ -37,6 +38,11 @@ class Group:
         group.add_argument(
             "--no-" + args[0][2:], *args[1:], action="store_false", **kwargs
         )
+        if nullable:
+            params = {args[0][2:].replace("-", "_"): None}
+            group.set_defaults(**params)
+
+    def prepare(self, args) -> None: ...
 
 
 class GeneralGroup(Group):
@@ -50,11 +56,30 @@ class GeneralGroup(Group):
         )
 
         self.container.add_argument(
-            "module",
+            "target",
             help=(
-                "Path to your Sanic app. Example: path.to.server:app\n"
-                "If running a Simple Server, path to directory to serve. "
-                "Example: ./\n"
+                "Path to your Sanic app instance.\n"
+                "\tExample: path.to.server:app\n"
+                "If running a Simple Server, path to directory to serve.\n"
+                "\tExample: ./\n"
+                "Additionally, this can be a path to a factory function\n"
+                "that returns a Sanic app instance.\n"
+                "\tExample: path.to.server:create_app\n"
+            ),
+        )
+
+        self.container.add_argument(
+            "action",
+            nargs="?",
+            default="serve",
+            choices=[
+                "serve",
+                "exec",
+            ],
+            help=(
+                "Action to perform.\n"
+                "\tserve: Run the Sanic app\n"
+                "\texec: Execute a command in the Sanic app context\n"
             ),
         )
 
@@ -63,7 +88,8 @@ class ApplicationGroup(Group):
     name = "Application"
 
     def attach(self):
-        self.container.add_argument(
+        group = self.container.add_mutually_exclusive_group()
+        group.add_argument(
             "--factory",
             action="store_true",
             help=(
@@ -71,7 +97,7 @@ class ApplicationGroup(Group):
                 "i.e. a () -> <Sanic app> callable"
             ),
         )
-        self.container.add_argument(
+        group.add_argument(
             "-s",
             "--simple",
             dest="simple",
@@ -81,6 +107,48 @@ class ApplicationGroup(Group):
                 "a directory\n(module arg should be a path)"
             ),
         )
+        self.add_bool_arguments(
+            "--repl",
+            help="Run the server with an interactive shell session",
+        )
+
+
+class HTTPVersionGroup(Group):
+    name = "HTTP version"
+
+    def attach(self):
+        http_values = [http.value for http in HTTP.__members__.values()]
+
+        self.container.add_argument(
+            "--http",
+            dest="http",
+            action="append",
+            choices=http_values,
+            type=int,
+            help=(
+                "Which HTTP version to use: HTTP/1.1 or HTTP/3. Value should\n"
+                "be either 1, or 3. [default 1]"
+            ),
+        )
+        self.container.add_argument(
+            "-1",
+            dest="http",
+            action="append_const",
+            const=1,
+            help=("Run Sanic server using HTTP/1.1"),
+        )
+        self.container.add_argument(
+            "-3",
+            dest="http",
+            action="append_const",
+            const=3,
+            help=("Run Sanic server using HTTP/3"),
+        )
+
+    def prepare(self, args):
+        if not args.http:
+            args.http = [1]
+        args.http = tuple(sorted(set(map(HTTP, args.http)), reverse=True))
 
 
 class SocketGroup(Group):
@@ -92,7 +160,6 @@ class SocketGroup(Group):
             "--host",
             dest="host",
             type=str,
-            default="127.0.0.1",
             help="Host address [default 127.0.0.1]",
         )
         self.container.add_argument(
@@ -100,7 +167,6 @@ class SocketGroup(Group):
             "--port",
             dest="port",
             type=int,
-            default=8000,
             help="Port to serve on [default 8000]",
         )
         self.container.add_argument(
@@ -167,8 +233,17 @@ class WorkerGroup(Group):
             action="store_true",
             help="Set the number of workers to max allowed",
         )
+        group.add_argument(
+            "--single-process",
+            dest="single",
+            action="store_true",
+            help="Do not use multiprocessing, run server in a single process",
+        )
         self.add_bool_arguments(
-            "--access-logs", dest="access_log", help="display access logs"
+            "--access-logs",
+            dest="access_log",
+            help="display access logs",
+            default=None,
         )
 
 
@@ -181,18 +256,6 @@ class DevelopmentGroup(Group):
             dest="debug",
             action="store_true",
             help="Run the server in debug mode",
-        )
-        self.container.add_argument(
-            "-d",
-            "--dev",
-            dest="debug",
-            action="store_true",
-            help=(
-                "Currently is an alias for --debug. But starting in v22.3, \n"
-                "--debug will no longer automatically trigger auto_restart. \n"
-                "However, --dev will continue, effectively making it the \n"
-                "same as debug + auto_reload."
-            ),
         )
         self.container.add_argument(
             "-r",
@@ -212,12 +275,34 @@ class DevelopmentGroup(Group):
             action="append",
             help="Extra directories to watch and reload on changes",
         )
+        self.container.add_argument(
+            "-d",
+            "--dev",
+            dest="dev",
+            action="store_true",
+            help=("debug + auto reload"),
+        )
+        self.container.add_argument(
+            "--auto-tls",
+            dest="auto_tls",
+            action="store_true",
+            help=(
+                "Create a temporary TLS certificate for local development "
+                "(requires mkcert or trustme)"
+            ),
+        )
 
 
 class OutputGroup(Group):
     name = "Output"
 
     def attach(self):
+        self.add_bool_arguments(
+            "--coffee",
+            dest="coffee",
+            default=False,
+            help="Uhm, coffee?",
+        )
         self.add_bool_arguments(
             "--motd",
             dest="motd",
@@ -234,4 +319,5 @@ class OutputGroup(Group):
             "--noisy-exceptions",
             dest="noisy_exceptions",
             help="Output stack traces for all exceptions",
+            default=None,
         )

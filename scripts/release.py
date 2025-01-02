@@ -1,17 +1,20 @@
 #!/usr/bin/env python
 
+import sys
+
 from argparse import ArgumentParser, Namespace
 from collections import OrderedDict
 from configparser import RawConfigParser
 from datetime import datetime
 from json import dumps
-from os import path, chdir
-from subprocess import Popen, PIPE
+from os import chdir, path
+from subprocess import PIPE, Popen
 
-from jinja2 import Environment, BaseLoader
-from requests import patch
-import sys
 import towncrier
+
+from jinja2 import BaseLoader, Environment
+from requests import patch
+
 
 GIT_COMMANDS = {
     "get_tag": ["git describe --tags --abbrev=0"],
@@ -78,7 +81,7 @@ def _run_shell_command(command: list):
         output, error = process.communicate()
         return_code = process.returncode
         return output.decode("utf-8"), error, return_code
-    except:
+    except Exception:
         return None, None, -1
 
 
@@ -310,7 +313,7 @@ if __name__ == "__main__":
     cli.add_argument(
         "--milestone",
         "-ms",
-        help="Git Release milestone information to include in relase note",
+        help="Git Release milestone information to include in release note",
         required=False,
     )
     cli.add_argument(

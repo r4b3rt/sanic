@@ -1,10 +1,13 @@
+import uuid
+
 from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import pytest
 
 from sanic import Sanic, response
-from sanic.request import Request, uuid
+from sanic.exceptions import BadURL, SanicException
+from sanic.request import Request
 from sanic.server import HttpProtocol
 
 
@@ -149,30 +152,187 @@ def test_request_accept():
     async def get(request):
         return response.empty()
 
+    header_value = "text/plain;format=flowed, text/plain, text/*, */*"
     request, _ = app.test_client.get(
         "/",
-        headers={
-            "Accept": "text/*, text/plain, text/plain;format=flowed, */*"
-        },
+        headers={"Accept": header_value},
     )
-    assert request.accept == [
+    assert str(request.accept) == header_value
+    match = request.accept.match(
+        "*/*;format=flowed",
         "text/plain;format=flowed",
         "text/plain",
         "text/*",
         "*/*",
-    ]
+    )
+    assert match == "*/*;format=flowed"
+    assert match.header.mime == "text/plain"
+    assert match.header.params == {"format": "flowed"}
 
+    header_value = (
+        "text/plain; q=0.5,   text/html, text/x-dvi; q=0.8, text/x-c"
+    )
     request, _ = app.test_client.get(
         "/",
-        headers={
-            "Accept": (
-                "text/plain; q=0.5, text/html, text/x-dvi; q=0.8, text/x-c"
-            )
-        },
+        headers={"Accept": header_value},
     )
-    assert request.accept == [
+    assert [str(i) for i in request.accept] == [
         "text/html",
         "text/x-c",
-        "text/x-dvi; q=0.8",
-        "text/plain; q=0.5",
+        "text/x-dvi;q=0.8",
+        "text/plain;q=0.5",
     ]
+    match = request.accept.match(
+        "application/json",
+        "text/plain",  # Has lower q in accept header
+        "text/html;format=flowed",  # Params mismatch
+        "text/*",  # Matches
+        "*/*",
+    )
+    assert match == "text/*"
+    assert match.header.mime == "text/html"
+    assert match.header.q == 1.0
+    assert not match.header.params
+
+
+def test_bad_url_parse():
+    message = "Bad URL: my.redacted-domain.com:443"
+    with pytest.raises(BadURL, match=message):
+        Request(
+            b"my.redacted-domain.com:443",
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+        )
+
+
+def test_request_scope_raises_exception_when_no_asgi():
+    app = Sanic("no_asgi")
+
+    @app.get("/")
+    async def get(request):
+        return request.scope
+
+    request, response = app.test_client.get("/")
+    assert response.status == 500
+    with pytest.raises(NotImplementedError):
+        _ = request.scope
+
+
+@pytest.mark.asyncio
+async def test_request_scope_is_not_none_when_running_in_asgi(app):
+    @app.get("/")
+    async def get(request):
+        return response.empty()
+
+    request, _ = await app.asgi_client.get("/")
+
+    assert request.scope is not None
+    assert request.scope["method"].lower() == "get"
+    assert request.scope["path"].lower() == "/"
+
+
+def test_cannot_get_request_outside_of_cycle():
+    with pytest.raises(SanicException, match="No current request"):
+        Request.get_current()
+
+
+def test_get_current_request(app):
+    @app.get("/")
+    async def get(request):
+        return response.json({"same": request is Request.get_current()})
+
+    _, resp = app.test_client.get("/")
+    assert resp.json["same"]
+
+
+def test_request_stream_id(app):
+    @app.get("/")
+    async def get(request):
+        try:
+            request.stream_id
+        except Exception as e:
+            return response.text(str(e))
+
+    _, resp = app.test_client.get("/")
+    assert resp.text == "Stream ID is only a property of a HTTP/3 request"
+
+
+@pytest.mark.parametrize(
+    "method,safe",
+    (
+        ("DELETE", False),
+        ("GET", True),
+        ("HEAD", True),
+        ("OPTIONS", True),
+        ("PATCH", False),
+        ("POST", False),
+        ("PUT", False),
+    ),
+)
+def test_request_safe(method, safe):
+    request = Request(b"/", {}, None, method, None, None)
+    assert request.is_safe is safe
+
+
+@pytest.mark.parametrize(
+    "method,idempotent",
+    (
+        ("DELETE", True),
+        ("GET", True),
+        ("HEAD", True),
+        ("OPTIONS", True),
+        ("PATCH", False),
+        ("POST", False),
+        ("PUT", True),
+    ),
+)
+def test_request_idempotent(method, idempotent):
+    request = Request(b"/", {}, None, method, None, None)
+    assert request.is_idempotent is idempotent
+
+
+@pytest.mark.parametrize(
+    "method,cacheable",
+    (
+        ("DELETE", False),
+        ("GET", True),
+        ("HEAD", True),
+        ("OPTIONS", False),
+        ("PATCH", False),
+        ("POST", False),
+        ("PUT", False),
+    ),
+)
+def test_request_cacheable(method, cacheable):
+    request = Request(b"/", {}, None, method, None, None)
+    assert request.is_cacheable is cacheable
+
+
+def test_custom_ctx():
+    class CustomContext:
+        FOO = "foo"
+
+    class CustomRequest(Request[Sanic, CustomContext]):
+        @staticmethod
+        def make_context() -> CustomContext:
+            return CustomContext()
+
+    app = Sanic("Test", request_class=CustomRequest)
+
+    @app.get("/")
+    async def handler(request: CustomRequest):
+        return response.json(
+            [
+                isinstance(request, CustomRequest),
+                isinstance(request.ctx, CustomContext),
+                request.ctx.FOO,
+            ]
+        )
+
+    _, resp = app.test_client.get("/")
+
+    assert resp.json == [True, True, "foo"]

@@ -1,73 +1,75 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.config
-import os
-import platform
 import re
 import sys
 
 from asyncio import (
     AbstractEventLoop,
     CancelledError,
-    Protocol,
+    Task,
     ensure_future,
-    get_event_loop,
+    get_running_loop,
     wait_for,
 )
 from asyncio.futures import Future
 from collections import defaultdict, deque
-from functools import partial
-from importlib import import_module
+from collections.abc import Awaitable, Coroutine, Iterable, Iterator
+from contextlib import contextmanager, suppress
+from enum import Enum
+from functools import partial, wraps
 from inspect import isawaitable
+from os import environ
 from pathlib import Path
 from socket import socket
-from ssl import SSLContext
 from traceback import format_exc
 from types import SimpleNamespace
 from typing import (
+    TYPE_CHECKING,
     Any,
     AnyStr,
-    Awaitable,
     Callable,
-    Coroutine,
+    ClassVar,
     Deque,
-    Dict,
-    Iterable,
-    List,
+    Generic,
+    Literal,
     Optional,
-    Set,
-    Tuple,
-    Type,
+    TypeVar,
     Union,
+    cast,
+    overload,
 )
 from urllib.parse import urlencode, urlunparse
 
-from sanic_routing.exceptions import (  # type: ignore
-    FinalizationError,
-    NotFound,
-)
-from sanic_routing.route import Route  # type: ignore
+from sanic_routing.exceptions import FinalizationError, NotFound
+from sanic_routing.route import Route
 
-from sanic import reloader_helpers
-from sanic.application.logo import get_logo
-from sanic.application.motd import MOTD
-from sanic.application.state import ApplicationState, Mode
-from sanic.asgi import ASGIApp
-from sanic.base import BaseSanic
+from sanic.application.ext import setup_ext
+from sanic.application.state import ApplicationState, ServerStage
+from sanic.asgi import ASGIApp, Lifespan
+from sanic.base.root import BaseSanic
 from sanic.blueprint_group import BlueprintGroup
 from sanic.blueprints import Blueprint
 from sanic.compat import OS_IS_WINDOWS, enable_windows_color_support
 from sanic.config import SANIC_PREFIX, Config
 from sanic.exceptions import (
-    InvalidUsage,
+    BadRequest,
     SanicException,
     ServerError,
     URLBuildError,
 )
 from sanic.handlers import ErrorHandler
-from sanic.log import LOGGING_CONFIG_DEFAULTS, Colors, error_logger, logger
+from sanic.helpers import Default, _default
+from sanic.http import Stage
+from sanic.log import LOGGING_CONFIG_DEFAULTS, error_logger, logger
+from sanic.logging.setup import setup_logging
+from sanic.middleware import Middleware, MiddlewareLocation
+from sanic.mixins.commands import CommandMixin
 from sanic.mixins.listeners import ListenerEvent
+from sanic.mixins.startup import StartupMixin
+from sanic.mixins.static import StaticHandleMixin
 from sanic.models.futures import (
     FutureException,
     FutureListener,
@@ -75,30 +77,97 @@ from sanic.models.futures import (
     FutureRegistry,
     FutureRoute,
     FutureSignal,
-    FutureStatic,
 )
 from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
 from sanic.request import Request
-from sanic.response import BaseHTTPResponse, HTTPResponse
+from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
-from sanic.server import AsyncioServer, HttpProtocol
-from sanic.server import Signal as ServerSignal
-from sanic.server import serve, serve_multiple, serve_single
-from sanic.server.protocols.websocket_protocol import WebSocketProtocol
 from sanic.server.websockets.impl import ConnectionClosed
-from sanic.signals import Signal, SignalRouter
-from sanic.tls import process_to_context
+from sanic.signals import Event, Signal, SignalRouter
 from sanic.touchup import TouchUp, TouchUpMeta
+from sanic.types.shared_ctx import SharedContext
+from sanic.worker.inspector import Inspector
+from sanic.worker.loader import CertLoader
+from sanic.worker.manager import WorkerManager
 
 
-if OS_IS_WINDOWS:
+if TYPE_CHECKING:
+    try:
+        from sanic_ext import Extend  # type: ignore
+        from sanic_ext.extensions.base import Extension  # type: ignore
+    except ImportError:
+        Extend = TypeVar("Extend", type)  # type: ignore
+
+
+if OS_IS_WINDOWS:  # no cov
     enable_windows_color_support()
 
+ctx_type = TypeVar("ctx_type")
+config_type = TypeVar("config_type", bound=Config)
 
-class Sanic(BaseSanic, metaclass=TouchUpMeta):
-    """
-    The main application instance
+
+class Sanic(
+    Generic[config_type, ctx_type],
+    StaticHandleMixin,
+    BaseSanic,
+    StartupMixin,
+    CommandMixin,
+    metaclass=TouchUpMeta,
+):
+    """The main application instance
+
+    You will create an instance of this class and use it to register
+    routes, listeners, middleware, blueprints, error handlers, etc.
+
+    By convention, it is often called `app`. It must be named using
+    the `name` parameter and is roughly constrained to the same
+    restrictions as a Python module name, however, it can contain
+    hyphens (`-`).
+
+    ```python
+    # will cause an error because it contains spaces
+    Sanic("This is not legal")
+    ```
+
+    ```python
+    # this is legal
+    Sanic("Hyphens-are-legal_or_also_underscores")
+    ```
+
+    Args:
+        name (str): The name of the application. Must be a valid
+            Python module name (including hyphens).
+        config (Optional[config_type]): The configuration to use for
+            the application. Defaults to `None`.
+        ctx (Optional[ctx_type]): The context to use for the
+            application. Defaults to `None`.
+        router (Optional[Router]): The router to use for the
+            application. Defaults to `None`.
+        signal_router (Optional[SignalRouter]): The signal router to
+            use for the application. Defaults to `None`.
+        error_handler (Optional[ErrorHandler]): The error handler to
+            use for the application. Defaults to `None`.
+        env_prefix (Optional[str]): The prefix to use for environment
+            variables. Defaults to `SANIC_`.
+        request_class (Optional[Type[Request]]): The request class to
+            use for the application. Defaults to `Request`.
+        strict_slashes (bool): Whether to enforce strict slashes.
+            Defaults to `False`.
+        log_config (Optional[Dict[str, Any]]): The logging configuration
+            to use for the application. Defaults to `None`.
+        configure_logging (bool): Whether to configure logging.
+            Defaults to `True`.
+        dumps (Optional[Callable[..., AnyStr]]): The function to use
+            for serializing JSON. Defaults to `None`.
+        loads (Optional[Callable[..., Any]]): The function to use
+            for deserializing JSON. Defaults to `None`.
+        inspector (bool): Whether to enable the inspector. Defaults
+            to `False`.
+        inspector_class (Optional[Type[Inspector]]): The inspector
+            class to use for the application. Defaults to `None`.
+        certloader_class (Optional[Type[CertLoader]]): The certloader
+            class to use for the application. Defaults to `None`.
     """
 
     __touchup__ = (
@@ -107,12 +176,14 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         "_run_response_middleware",
         "_run_request_middleware",
     )
-    __fake_slots__ = (
-        "_app_registry",
+    __slots__ = (
         "_asgi_app",
+        "_asgi_lifespan",
         "_asgi_client",
         "_blueprint_order",
         "_delayed_tasks",
+        "_ext",
+        "_future_commands",
         "_future_exceptions",
         "_future_listeners",
         "_future_middleware",
@@ -120,169 +191,254 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         "_future_routes",
         "_future_signals",
         "_future_statics",
+        "_inspector",
+        "_manager",
         "_state",
+        "_task_registry",
         "_test_client",
         "_test_manager",
-        "asgi",
-        "auto_reload",
-        "auto_reload",
         "blueprints",
+        "certloader_class",
         "config",
         "configure_logging",
         "ctx",
-        "debug",
         "error_handler",
+        "inspector_class",
         "go_fast",
-        "is_running",
-        "is_stopping",
         "listeners",
-        "name",
+        "multiplexer",
         "named_request_middleware",
         "named_response_middleware",
         "request_class",
         "request_middleware",
         "response_middleware",
         "router",
+        "shared_ctx",
         "signal_router",
         "sock",
         "strict_slashes",
-        "test_mode",
         "websocket_enabled",
         "websocket_tasks",
     )
 
-    _app_registry: Dict[str, "Sanic"] = {}
-    test_mode = False
+    _app_registry: ClassVar[dict[str, Sanic]] = {}
+    test_mode: ClassVar[bool] = False
 
+    @overload
     def __init__(
-        self,
-        name: str = None,
-        config: Optional[Config] = None,
-        ctx: Optional[Any] = None,
+        self: Sanic[Config, SimpleNamespace],
+        name: str,
+        config: None = None,
+        ctx: None = None,
         router: Optional[Router] = None,
         signal_router: Optional[SignalRouter] = None,
         error_handler: Optional[ErrorHandler] = None,
-        load_env: Union[bool, str] = True,
         env_prefix: Optional[str] = SANIC_PREFIX,
-        request_class: Optional[Type[Request]] = None,
+        request_class: Optional[type[Request]] = None,
         strict_slashes: bool = False,
-        log_config: Optional[Dict[str, Any]] = None,
+        log_config: Optional[dict[str, Any]] = None,
         configure_logging: bool = True,
-        register: Optional[bool] = None,
         dumps: Optional[Callable[..., AnyStr]] = None,
+        loads: Optional[Callable[..., Any]] = None,
+        inspector: bool = False,
+        inspector_class: Optional[type[Inspector]] = None,
+        certloader_class: Optional[type[CertLoader]] = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: Sanic[config_type, SimpleNamespace],
+        name: str,
+        config: Optional[config_type] = None,
+        ctx: None = None,
+        router: Optional[Router] = None,
+        signal_router: Optional[SignalRouter] = None,
+        error_handler: Optional[ErrorHandler] = None,
+        env_prefix: Optional[str] = SANIC_PREFIX,
+        request_class: Optional[type[Request]] = None,
+        strict_slashes: bool = False,
+        log_config: Optional[dict[str, Any]] = None,
+        configure_logging: bool = True,
+        dumps: Optional[Callable[..., AnyStr]] = None,
+        loads: Optional[Callable[..., Any]] = None,
+        inspector: bool = False,
+        inspector_class: Optional[type[Inspector]] = None,
+        certloader_class: Optional[type[CertLoader]] = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: Sanic[Config, ctx_type],
+        name: str,
+        config: None = None,
+        ctx: Optional[ctx_type] = None,
+        router: Optional[Router] = None,
+        signal_router: Optional[SignalRouter] = None,
+        error_handler: Optional[ErrorHandler] = None,
+        env_prefix: Optional[str] = SANIC_PREFIX,
+        request_class: Optional[type[Request]] = None,
+        strict_slashes: bool = False,
+        log_config: Optional[dict[str, Any]] = None,
+        configure_logging: bool = True,
+        dumps: Optional[Callable[..., AnyStr]] = None,
+        loads: Optional[Callable[..., Any]] = None,
+        inspector: bool = False,
+        inspector_class: Optional[type[Inspector]] = None,
+        certloader_class: Optional[type[CertLoader]] = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: Sanic[config_type, ctx_type],
+        name: str,
+        config: Optional[config_type] = None,
+        ctx: Optional[ctx_type] = None,
+        router: Optional[Router] = None,
+        signal_router: Optional[SignalRouter] = None,
+        error_handler: Optional[ErrorHandler] = None,
+        env_prefix: Optional[str] = SANIC_PREFIX,
+        request_class: Optional[type[Request]] = None,
+        strict_slashes: bool = False,
+        log_config: Optional[dict[str, Any]] = None,
+        configure_logging: bool = True,
+        dumps: Optional[Callable[..., AnyStr]] = None,
+        loads: Optional[Callable[..., Any]] = None,
+        inspector: bool = False,
+        inspector_class: Optional[type[Inspector]] = None,
+        certloader_class: Optional[type[CertLoader]] = None,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        name: str,
+        config: Optional[config_type] = None,
+        ctx: Optional[ctx_type] = None,
+        router: Optional[Router] = None,
+        signal_router: Optional[SignalRouter] = None,
+        error_handler: Optional[ErrorHandler] = None,
+        env_prefix: Optional[str] = SANIC_PREFIX,
+        request_class: Optional[type[Request]] = None,
+        strict_slashes: bool = False,
+        log_config: Optional[dict[str, Any]] = None,
+        configure_logging: bool = True,
+        dumps: Optional[Callable[..., AnyStr]] = None,
+        loads: Optional[Callable[..., Any]] = None,
+        inspector: bool = False,
+        inspector_class: Optional[type[Inspector]] = None,
+        certloader_class: Optional[type[CertLoader]] = None,
     ) -> None:
         super().__init__(name=name)
-
         # logging
         if configure_logging:
             dict_config = log_config or LOGGING_CONFIG_DEFAULTS
             logging.config.dictConfig(dict_config)  # type: ignore
 
-        if config and (load_env is not True or env_prefix != SANIC_PREFIX):
+        if config and env_prefix != SANIC_PREFIX:
             raise SanicException(
                 "When instantiating Sanic with config, you cannot also pass "
-                "load_env or env_prefix"
+                "env_prefix"
             )
 
+        # First setup config
+        self.config: config_type = cast(
+            config_type, config or Config(env_prefix=env_prefix)
+        )
+        if inspector:
+            self.config.INSPECTOR = inspector
+
+        # Then we can do the rest
+        self._asgi_app: Optional[ASGIApp] = None
+        self._asgi_lifespan: Optional[Lifespan] = None
         self._asgi_client: Any = None
+        self._blueprint_order: list[Blueprint] = []
+        self._delayed_tasks: list[str] = []
+        self._future_registry: FutureRegistry = FutureRegistry()
+        self._inspector: Optional[Inspector] = None
+        self._manager: Optional[WorkerManager] = None
+        self._state: ApplicationState = ApplicationState(app=self)
+        self._task_registry: dict[str, Union[Task, None]] = {}
         self._test_client: Any = None
         self._test_manager: Any = None
-        self._blueprint_order: List[Blueprint] = []
-        self._delayed_tasks: List[str] = []
-        self._future_registry: FutureRegistry = FutureRegistry()
-        self._state: ApplicationState = ApplicationState(app=self)
-        self.blueprints: Dict[str, Blueprint] = {}
-        self.config: Config = config or Config(
-            load_env=load_env,
-            env_prefix=env_prefix,
-            app=self,
+        self.asgi = False
+        self.auto_reload = False
+        self.blueprints: dict[str, Blueprint] = {}
+        self.certloader_class: type[CertLoader] = (
+            certloader_class or CertLoader
         )
         self.configure_logging: bool = configure_logging
-        self.ctx: Any = ctx or SimpleNamespace()
-        self.debug = False
+        self.ctx: ctx_type = cast(ctx_type, ctx or SimpleNamespace())
         self.error_handler: ErrorHandler = error_handler or ErrorHandler()
-        self.listeners: Dict[str, List[ListenerType[Any]]] = defaultdict(list)
-        self.named_request_middleware: Dict[str, Deque[MiddlewareType]] = {}
-        self.named_response_middleware: Dict[str, Deque[MiddlewareType]] = {}
-        self.request_class: Type[Request] = request_class or Request
-        self.request_middleware: Deque[MiddlewareType] = deque()
-        self.response_middleware: Deque[MiddlewareType] = deque()
+        self.inspector_class: type[Inspector] = inspector_class or Inspector
+        self.listeners: dict[str, list[ListenerType[Any]]] = defaultdict(list)
+        self.named_request_middleware: dict[str, Deque[Middleware]] = {}
+        self.named_response_middleware: dict[str, Deque[Middleware]] = {}
+        self.request_class = request_class or Request
+        self.request_middleware: Deque[Middleware] = deque()
+        self.response_middleware: Deque[Middleware] = deque()
         self.router: Router = router or Router()
+        self.shared_ctx: SharedContext = SharedContext()
         self.signal_router: SignalRouter = signal_router or SignalRouter()
         self.sock: Optional[socket] = None
         self.strict_slashes: bool = strict_slashes
         self.websocket_enabled: bool = False
-        self.websocket_tasks: Set[Future[Any]] = set()
+        self.websocket_tasks: set[Future[Any]] = set()
 
         # Register alternative method names
         self.go_fast = self.run
-
-        if register is not None:
-            self.config.REGISTER = register
-        if self.config.REGISTER:
-            self.__class__.register_app(self)
-
         self.router.ctx.app = self
         self.signal_router.ctx.app = self
+        self.__class__.register_app(self)
 
         if dumps:
             BaseHTTPResponse._dumps = dumps  # type: ignore
+        if loads:
+            Request._loads = loads  # type: ignore
 
     @property
-    def loop(self):
-        """
-        Synonymous with asyncio.get_event_loop().
+    def loop(self) -> AbstractEventLoop:
+        """Synonymous with asyncio.get_event_loop().
 
         .. note::
-
             Only supported when using the `app.run` method.
+
+        Returns:
+            AbstractEventLoop: The event loop for the application.
+
+        Raises:
+            SanicException: If the application is not running.
         """
-        if not self.is_running and self.asgi is False:
+        if self.state.stage is ServerStage.STOPPED and self.asgi is False:
             raise SanicException(
                 "Loop can only be retrieved after the app has started "
                 "running. Not supported with `create_server` function"
             )
-        return get_event_loop()
+        try:
+            return get_running_loop()
+        except RuntimeError:  # no cov
+            if sys.version_info > (3, 10):
+                return asyncio.get_event_loop_policy().get_event_loop()
+            else:
+                return asyncio.get_event_loop()
 
     # -------------------------------------------------------------------- #
     # Registration
     # -------------------------------------------------------------------- #
 
-    def add_task(
-        self,
-        task: Union[Future[Any], Coroutine[Any, Any, Any], Awaitable[Any]],
-    ) -> None:
-        """
-        Schedule a task to run later, after the loop has started.
-        Different from asyncio.ensure_future in that it does not
-        also return a future, and the actual ensure_future call
-        is delayed until before server start.
-
-        `See user guide re: background tasks
-        <https://sanicframework.org/guide/basics/tasks.html#background-tasks>`__
-
-        :param task: future, couroutine or awaitable
-        """
-        try:
-            loop = self.loop  # Will raise SanicError if loop is not started
-            self._loop_add_task(task, self, loop)
-        except SanicException:
-            task_name = f"sanic.delayed_task.{hash(task)}"
-            if not self._delayed_tasks:
-                self.after_server_start(partial(self.dispatch_delayed_tasks))
-
-            self.signal(task_name)(partial(self.run_delayed_task, task=task))
-            self._delayed_tasks.append(task_name)
-
     def register_listener(
-        self, listener: ListenerType[SanicVar], event: str
+        self,
+        listener: ListenerType[SanicVar],
+        event: str,
+        *,
+        priority: int = 0,
     ) -> ListenerType[SanicVar]:
-        """
-        Register the listener for a given event.
+        """Register the listener for a given event.
 
-        :param listener: callable i.e. setup_db(app, loop)
-        :param event: when to register listener i.e. 'before_server_start'
-        :return: listener
+        Args:
+            listener (Callable): The listener to register.
+            event (str): The event to listen for.
+
+        Returns:
+            Callable: The listener that was registered.
         """
 
         try:
@@ -291,79 +447,124 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             valid = ", ".join(
                 map(lambda x: x.lower(), ListenerEvent.__members__.keys())
             )
-            raise InvalidUsage(f"Invalid event: {event}. Use one of: {valid}")
+            raise BadRequest(f"Invalid event: {event}. Use one of: {valid}")
 
         if "." in _event:
-            self.signal(_event.value)(
+            self.signal(_event.value, priority=priority)(
                 partial(self._listener, listener=listener)
             )
         else:
+            if priority:
+                error_logger.warning(
+                    f"Priority is not supported for {_event.value}"
+                )
             self.listeners[_event.value].append(listener)
 
         return listener
 
     def register_middleware(
-        self, middleware: MiddlewareType, attach_to: str = "request"
-    ) -> MiddlewareType:
-        """
-        Register an application level middleware that will be attached
-        to all the API URLs registered under this application.
+        self,
+        middleware: Union[MiddlewareType, Middleware],
+        attach_to: str = "request",
+        *,
+        priority: Union[Default, int] = _default,
+    ) -> Union[MiddlewareType, Middleware]:
+        """Register a middleware to be called before a request is handled.
 
-        This method is internally invoked by the :func:`middleware`
-        decorator provided at the app level.
+        Args:
+            middleware (Callable): A callable that takes in a request.
+            attach_to (str): Whether to attach to request or response.
+                Defaults to `'request'`.
+            priority (int): The priority level of the middleware.
+                Lower numbers are executed first. Defaults to `0`.
 
-        :param middleware: Callback method to be attached to the
-            middleware
-        :param attach_to: The state at which the middleware needs to be
-            invoked in the lifecycle of an *HTTP Request*.
-            **request** - Invoke before the request is processed
-            **response** - Invoke before the response is returned back
-        :return: decorated method
+        Returns:
+            Union[Callable, Callable[[Callable], Callable]]: The decorated
+                middleware function or a partial function depending on how
+                the method was called.
         """
-        if attach_to == "request":
+        retval = middleware
+        location = MiddlewareLocation[attach_to.upper()]
+
+        if not isinstance(middleware, Middleware):
+            middleware = Middleware(
+                middleware,
+                location=location,
+                priority=priority if isinstance(priority, int) else 0,
+            )
+        elif middleware.priority != priority and isinstance(priority, int):
+            middleware = Middleware(
+                middleware.func,
+                location=middleware.location,
+                priority=priority,
+            )
+
+        if location is MiddlewareLocation.REQUEST:
             if middleware not in self.request_middleware:
                 self.request_middleware.append(middleware)
-        if attach_to == "response":
+        if location is MiddlewareLocation.RESPONSE:
             if middleware not in self.response_middleware:
                 self.response_middleware.appendleft(middleware)
-        return middleware
+        return retval
 
     def register_named_middleware(
         self,
         middleware: MiddlewareType,
         route_names: Iterable[str],
         attach_to: str = "request",
+        *,
+        priority: Union[Default, int] = _default,
     ):
-        """
-        Method for attaching middleware to specific routes. This is mainly an
-        internal tool for use by Blueprints to attach middleware to only its
-        specfic routes. But, it could be used in a more generalized fashion.
+        """Used to register named middleqare (middleware typically on blueprints)
 
-        :param middleware: the middleware to execute
-        :param route_names: a list of the names of the endpoints
-        :type route_names: Iterable[str]
-        :param attach_to: whether to attach to request or response,
-            defaults to "request"
-        :type attach_to: str, optional
-        """
-        if attach_to == "request":
+        Args:
+            middleware (Callable): A callable that takes in a request.
+            route_names (Iterable[str]): The route names to attach the
+                middleware to.
+            attach_to (str): Whether to attach to request or response.
+                Defaults to `'request'`.
+            priority (int): The priority level of the middleware.
+                Lower numbers are executed first. Defaults to `0`.
+
+        Returns:
+            Union[Callable, Callable[[Callable], Callable]]: The decorated
+                middleware function or a partial function depending on how
+                the method was called.
+        """  # noqa: E501
+        retval = middleware
+        location = MiddlewareLocation[attach_to.upper()]
+
+        if not isinstance(middleware, Middleware):
+            middleware = Middleware(
+                middleware,
+                location=location,
+                priority=priority if isinstance(priority, int) else 0,
+            )
+        elif middleware.priority != priority and isinstance(priority, int):
+            middleware = Middleware(
+                middleware.func,
+                location=middleware.location,
+                priority=priority,
+            )
+
+        if location is MiddlewareLocation.REQUEST:
             for _rn in route_names:
                 if _rn not in self.named_request_middleware:
                     self.named_request_middleware[_rn] = deque()
                 if middleware not in self.named_request_middleware[_rn]:
                     self.named_request_middleware[_rn].append(middleware)
-        if attach_to == "response":
+        if location is MiddlewareLocation.RESPONSE:
             for _rn in route_names:
                 if _rn not in self.named_response_middleware:
                     self.named_response_middleware[_rn] = deque()
                 if middleware not in self.named_response_middleware[_rn]:
                     self.named_response_middleware[_rn].appendleft(middleware)
-        return middleware
+        return retval
 
     def _apply_exception_handler(
         self,
         handler: FutureException,
-        route_names: Optional[List[str]] = None,
+        route_names: Optional[list[str]] = None,
     ):
         """Decorate a function to be registered as a handler for exceptions
 
@@ -380,10 +581,15 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         return handler.handler
 
     def _apply_listener(self, listener: FutureListener):
-        return self.register_listener(listener.listener, listener.event)
+        return self.register_listener(
+            listener.listener, listener.event, priority=listener.priority
+        )
 
-    def _apply_route(self, route: FutureRoute) -> List[Route]:
+    def _apply_route(
+        self, route: FutureRoute, overwrite: bool = False
+    ) -> list[Route]:
         params = route._asdict()
+        params["overwrite"] = overwrite
         websocket = params.pop("websocket", False)
         subprotocols = params.pop("subprotocols", None)
 
@@ -398,45 +604,113 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             websocket_handler.is_websocket = True  # type: ignore
             params["handler"] = websocket_handler
 
-        routes = self.router.add(**params)
-        if isinstance(routes, Route):
-            routes = [routes]
-        for r in routes:
-            r.ctx.websocket = websocket
-            r.ctx.static = params.get("static", False)
+        ctx = params.pop("route_context")
+
+        with self.amend():
+            routes = self.router.add(**params)
+            if isinstance(routes, Route):
+                routes = [routes]
+
+            for r in routes:
+                r.extra.websocket = websocket
+                r.extra.static = params.get("static", False)
+                r.ctx.__dict__.update(ctx)
 
         return routes
-
-    def _apply_static(self, static: FutureStatic) -> Route:
-        return self._register_static(static)
 
     def _apply_middleware(
         self,
         middleware: FutureMiddleware,
-        route_names: Optional[List[str]] = None,
+        route_names: Optional[list[str]] = None,
     ):
-        if route_names:
-            return self.register_named_middleware(
-                middleware.middleware, route_names, middleware.attach_to
-            )
-        else:
-            return self.register_middleware(
-                middleware.middleware, middleware.attach_to
-            )
+        with self.amend():
+            if route_names:
+                return self.register_named_middleware(
+                    middleware.middleware, route_names, middleware.attach_to
+                )
+            else:
+                return self.register_middleware(
+                    middleware.middleware, middleware.attach_to
+                )
 
     def _apply_signal(self, signal: FutureSignal) -> Signal:
-        return self.signal_router.add(*signal)
+        with self.amend():
+            return self.signal_router.add(
+                handler=signal.handler,
+                event=signal.event,
+                condition=signal.condition,
+                exclusive=signal.exclusive,
+                priority=signal.priority,
+            )
+
+    @overload
+    def dispatch(
+        self,
+        event: str,
+        *,
+        condition: Optional[dict[str, str]] = None,
+        context: Optional[dict[str, Any]] = None,
+        fail_not_found: bool = True,
+        inline: Literal[True],
+        reverse: bool = False,
+    ) -> Coroutine[Any, Any, Awaitable[Any]]: ...
+
+    @overload
+    def dispatch(
+        self,
+        event: str,
+        *,
+        condition: Optional[dict[str, str]] = None,
+        context: Optional[dict[str, Any]] = None,
+        fail_not_found: bool = True,
+        inline: Literal[False] = False,
+        reverse: bool = False,
+    ) -> Coroutine[Any, Any, Awaitable[Task]]: ...
 
     def dispatch(
         self,
         event: str,
         *,
-        condition: Optional[Dict[str, str]] = None,
-        context: Optional[Dict[str, Any]] = None,
+        condition: Optional[dict[str, str]] = None,
+        context: Optional[dict[str, Any]] = None,
         fail_not_found: bool = True,
         inline: bool = False,
         reverse: bool = False,
-    ) -> Coroutine[Any, Any, Awaitable[Any]]:
+    ) -> Coroutine[Any, Any, Awaitable[Union[Task, Any]]]:
+        """Dispatches an event to the signal router.
+
+        Args:
+            event (str): Name of the event to dispatch.
+            condition (Optional[Dict[str, str]]): Condition for the
+                event dispatch.
+            context (Optional[Dict[str, Any]]): Context for the event dispatch.
+            fail_not_found (bool): Whether to fail if the event is not found.
+                Default is `True`.
+            inline (bool): If `True`, returns the result directly. If `False`,
+                returns a `Task`. Default is `False`.
+            reverse (bool): Whether to reverse the dispatch order.
+                Default is `False`.
+
+        Returns:
+            Coroutine[Any, Any, Awaitable[Union[Task, Any]]]: An awaitable
+                that returns the result directly if `inline=True`, or a `Task`
+                if `inline=False`.
+
+        Examples:
+            ```python
+            @app.signal("user.registration.created")
+            async def send_registration_email(**context):
+                await send_email(context["email"], template="registration")
+
+            @app.post("/register")
+            async def handle_registration(request):
+                await do_registration(request)
+                await request.app.dispatch(
+                    "user.registration.created",
+                    context={"email": request.json.email}
+                })
+            ```
+        """
         return self.signal_router.dispatch(
             event,
             context=context,
@@ -447,25 +721,126 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         )
 
     async def event(
-        self, event: str, timeout: Optional[Union[int, float]] = None
-    ):
-        signal = self.signal_router.name_index.get(event)
-        if not signal:
-            if self.config.EVENT_AUTOREGISTER:
-                self.signal_router.reset()
-                self.add_signal(None, event)
-                signal = self.signal_router.name_index[event]
-                self.signal_router.finalize()
-            else:
-                raise NotFound("Could not find signal %s" % event)
-        return await wait_for(signal.ctx.event.wait(), timeout=timeout)
+        self,
+        event: Union[str, Enum],
+        timeout: Optional[Union[int, float]] = None,
+        *,
+        condition: Optional[dict[str, Any]] = None,
+        exclusive: bool = True,
+    ) -> None:
+        """Wait for a specific event to be triggered.
 
-    def enable_websocket(self, enable=True):
+        This method waits for a named event to be triggered and can be used
+        in conjunction with the signal system to wait for specific signals.
+        If the event is not found and auto-registration of events is enabled,
+        the event will be registered and then waited on. If the event is not
+        found and auto-registration is not enabled, a `NotFound` exception
+        is raised.
+
+        Auto-registration can be handled by setting the `EVENT_AUTOREGISTER`
+        config value to `True`.
+
+        ```python
+        app.config.EVENT_AUTOREGISTER = True
+        ```
+
+        Args:
+            event (str): The name of the event to wait for.
+            timeout (Optional[Union[int, float]]): An optional timeout value
+                in seconds. If provided, the wait will be terminated if the
+                timeout is reached. Defaults to `None`, meaning no timeout.
+            condition: If provided, method will only return when the signal
+                is dispatched with the given condition.
+            exclusive: When true (default), the signal can only be dispatched
+                when the condition has been met. When ``False``, the signal can
+                be dispatched either with or without it.
+
+        Raises:
+            NotFound: If the event is not found and auto-registration of
+                events is not enabled.
+
+        Returns:
+            The context dict of the dispatched signal.
+
+        Examples:
+            ```python
+            async def wait_for_event(app):
+                while True:
+                    print("> waiting")
+                    await app.event("foo.bar.baz")
+                    print("> event found")
+
+            @app.after_server_start
+            async def after_server_start(app, loop):
+                app.add_task(wait_for_event(app))
+            ```
+        """
+
+        waiter = self.signal_router.get_waiter(event, condition, exclusive)
+
+        if not waiter and self.config.EVENT_AUTOREGISTER:
+            self.signal_router.reset()
+            self.add_signal(None, event)
+            waiter = self.signal_router.get_waiter(event, condition, exclusive)
+            self.signal_router.finalize()
+
+        if not waiter:
+            raise NotFound(f"Could not find signal {event}")
+
+        return await wait_for(waiter.wait(), timeout=timeout)
+
+    def report_exception(
+        self, handler: Callable[[Sanic, Exception], Coroutine[Any, Any, None]]
+    ) -> Callable[[Exception], Coroutine[Any, Any, None]]:
+        """Register a handler to report exceptions.
+
+        A convenience method to register a handler for the signal that
+        is emitted when an exception occurs. It is typically used to
+        report exceptions to an external service.
+
+        It is equivalent to:
+
+        ```python
+        @app.signal(Event.SERVER_EXCEPTION_REPORT)
+        async def report(exception):
+            await do_something_with_error(exception)
+        ```
+
+        Args:
+            handler (Callable[[Sanic, Exception], Coroutine[Any, Any, None]]):
+                The handler to register.
+
+        Returns:
+            Callable[[Sanic, Exception], Coroutine[Any, Any, None]]: The
+                handler that was registered.
+        """
+
+        @wraps(handler)
+        async def report(exception: Exception) -> None:
+            await handler(self, exception)
+
+        self.add_signal(
+            handler=report, event=Event.SERVER_EXCEPTION_REPORT.value
+        )
+
+        return report
+
+    def enable_websocket(self, enable: bool = True) -> None:
         """Enable or disable the support for websocket.
 
         Websocket is enabled automatically if websocket routes are
-        added to the application.
+        added to the application. This typically will not need to be
+        called manually.
+
+        Args:
+            enable (bool, optional): If set to `True`, enables websocket
+                support. If set to `False`, disables websocket support.
+                Defaults to `True`.
+
+        Returns:
+            None
         """
+
         if not self.websocket_enabled:
             # if the server is stopped, we want to cancel any ongoing
             # websocket tasks, to allow the server to exit promptly
@@ -475,32 +850,63 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
 
     def blueprint(
         self,
-        blueprint: Union[
-            Blueprint, List[Blueprint], Tuple[Blueprint], BlueprintGroup
-        ],
-        **options: Any,
-    ):
+        blueprint: Union[Blueprint, Iterable[Blueprint], BlueprintGroup],
+        *,
+        url_prefix: Optional[str] = None,
+        version: Optional[Union[int, float, str]] = None,
+        strict_slashes: Optional[bool] = None,
+        version_prefix: Optional[str] = None,
+        name_prefix: Optional[str] = None,
+    ) -> None:
         """Register a blueprint on the application.
 
-        :param blueprint: Blueprint object or (list, tuple) thereof
-        :param options: option dictionary with blueprint defaults
-        :return: Nothing
-        """
-        if isinstance(blueprint, (list, tuple, BlueprintGroup)):
+        See [Blueprints](/en/guide/best-practices/blueprints) for more information.
+
+        Args:
+            blueprint (Union[Blueprint, Iterable[Blueprint], BlueprintGroup]): Blueprint object or (list, tuple) thereof.
+            url_prefix (Optional[str]): Prefix for all URLs bound to the blueprint. Defaults to `None`.
+            version (Optional[Union[int, float, str]]): Version prefix for URLs. Defaults to `None`.
+            strict_slashes (Optional[bool]): Enforce the trailing slashes. Defaults to `None`.
+            version_prefix (Optional[str]): Prefix for version. Defaults to `None`.
+            name_prefix (Optional[str]): Prefix for the blueprint name. Defaults to `None`.
+
+        Example:
+            ```python
+            app = Sanic("TestApp")
+            bp = Blueprint('TestBP')
+
+            @bp.route('/route')
+            def handler(request):
+                return text('Hello, Blueprint!')
+
+            app.blueprint(bp, url_prefix='/blueprint')
+            ```
+        """  # noqa: E501
+        options: dict[str, Any] = {}
+        if url_prefix is not None:
+            options["url_prefix"] = url_prefix
+        if version is not None:
+            options["version"] = version
+        if strict_slashes is not None:
+            options["strict_slashes"] = strict_slashes
+        if version_prefix is not None:
+            options["version_prefix"] = version_prefix
+        if name_prefix is not None:
+            options["name_prefix"] = name_prefix
+        if isinstance(blueprint, (Iterable, BlueprintGroup)):
             for item in blueprint:
-                params = {**options}
+                params: dict[str, Any] = {**options}
                 if isinstance(blueprint, BlueprintGroup):
-                    if blueprint.url_prefix:
-                        merge_from = [
-                            options.get("url_prefix", ""),
-                            blueprint.url_prefix,
-                        ]
-                        if not isinstance(item, BlueprintGroup):
-                            merge_from.append(item.url_prefix or "")
-                        merged_prefix = "/".join(
-                            u.strip("/") for u in merge_from
-                        ).rstrip("/")
-                        params["url_prefix"] = f"/{merged_prefix}"
+                    merge_from = [
+                        options.get("url_prefix", ""),
+                        blueprint.url_prefix or "",
+                    ]
+                    if not isinstance(item, BlueprintGroup):
+                        merge_from.append(item.url_prefix or "")
+                    merged_prefix = "/".join(
+                        str(u).strip("/") for u in merge_from if u
+                    ).rstrip("/")
+                    params["url_prefix"] = f"/{merged_prefix}"
 
                     for _attr in ["version", "strict_slashes"]:
                         if getattr(item, _attr) is None:
@@ -514,6 +920,9 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                             )
                         else:
                             params["version_prefix"] = blueprint.version_prefix
+                    name_prefix = getattr(blueprint, "name_prefix", None)
+                    if name_prefix and "name_prefix" not in params:
+                        params["name_prefix"] = name_prefix
                 self.blueprint(item, **params)
             return
         if blueprint.name in self.blueprints:
@@ -535,50 +944,56 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
     def url_for(self, view_name: str, **kwargs):
         """Build a URL based on a view name and the values provided.
 
-        In order to build a URL, all request parameters must be supplied as
-        keyword arguments, and each parameter must pass the test for the
-        specified parameter type. If these conditions are not met, a
-        `URLBuildError` will be thrown.
+        This method constructs URLs for a given view name, taking into account
+        various special keyword arguments that can be used to modify the resulting
+        URL. It can handle internal routing as well as external URLs with different
+        schemes.
 
-        Keyword arguments that are not request parameters will be included in
-        the output URL's query string.
+        There are several special keyword arguments that can be used to modify
+        the URL that is built. They each begin with an underscore. They are:
 
-        There are several _special_ keyword arguments that will alter how the
-        URL will be returned:
+        - `_anchor`
+        - `_external`
+        - `_host`
+        - `_server`
+        - `_scheme`
 
-        1. **_anchor**: ``str`` - Adds an ``#anchor`` to the end
-        2. **_scheme**: ``str`` - Should be either ``"http"`` or ``"https"``,
-           default is ``"http"``
-        3. **_external**: ``bool`` - Whether to return the path or a full URL
-           with scheme and host
-        4. **_host**: ``str`` - Used when one or more hosts are defined for a
-           route to tell Sanic which to use
-           (only applies with ``_external=True``)
-        5. **_server**: ``str`` - If not using ``_host``, this will be used
-           for defining the hostname of the URL
-           (only applies with ``_external=True``),
-           defaults to ``app.config.SERVER_NAME``
-
-        If you want the PORT to appear in your URL, you should set it in:
-
-        .. code-block::
-
-            app.config.SERVER_NAME = "myserver:7777"
-
-        `See user guide re: routing
-        <https://sanicframework.org/guide/basics/routing.html#generating-a-url>`__
-
-        :param view_name: string referencing the view name
-        :param kwargs: keys and values that are used to build request
-            parameters and query string arguments.
-
-        :return: the built URL
+        Args:
+            view_name (str): String referencing the view name.
+            _anchor (str): Adds an "#anchor" to the end.
+            _scheme (str): Should be either "http" or "https", default is "http".
+            _external (bool): Whether to return the path or a full URL with scheme and host.
+            _host (str): Used when one or more hosts are defined for a route to tell Sanic which to use.
+            _server (str): If not using "_host", this will be used for defining the hostname of the URL.
+            **kwargs: Keys and values that are used to build request parameters and
+                    query string arguments.
 
         Raises:
-            URLBuildError
-        """
+            URLBuildError: If there are issues with constructing the URL.
+
+        Returns:
+            str: The built URL.
+
+        Examples:
+            Building a URL for a specific view with parameters:
+            ```python
+            url_for('view_name', param1='value1', param2='value2')
+            # /view-name?param1=value1&param2=value2
+            ```
+
+            Creating an external URL with a specific scheme and anchor:
+            ```python
+            url_for('view_name', _scheme='https', _external=True, _anchor='section1')
+            # https://example.com/view-name#section1
+            ```
+
+            Creating a URL with a specific host:
+            ```python
+            url_for('view_name', _host='subdomain.example.com')
+            # http://subdomain.example.com/view-name
+        """  # noqa: E501
         # find the route by the supplied view name
-        kw: Dict[str, str] = {}
+        kw: dict[str, str] = {}
         # special static files url_for
 
         if "." not in view_name:
@@ -598,7 +1013,7 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
 
         uri = route.path
 
-        if getattr(route.ctx, "static", None):
+        if getattr(route.extra, "static", None):
             filename = kwargs.pop("filename", "")
             # it's static folder
             if "__file_uri__" in uri:
@@ -631,18 +1046,18 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         host = kwargs.pop("_host", None)
         external = kwargs.pop("_external", False) or bool(host)
         scheme = kwargs.pop("_scheme", "")
-        if route.ctx.hosts and external:
-            if not host and len(route.ctx.hosts) > 1:
+        if route.extra.hosts and external:
+            if not host and len(route.extra.hosts) > 1:
                 raise ValueError(
-                    f"Host is ambiguous: {', '.join(route.ctx.hosts)}"
+                    f"Host is ambiguous: {', '.join(route.extra.hosts)}"
                 )
-            elif host and host not in route.ctx.hosts:
+            elif host and host not in route.extra.hosts:
                 raise ValueError(
                     f"Requested host ({host}) is not available for this "
-                    f"route: {route.ctx.hosts}"
+                    f"route: {route.extra.hosts}"
                 )
             elif not host:
-                host = list(route.ctx.hosts)[0]
+                host = list(route.extra.hosts)[0]
 
         if scheme and not external:
             raise ValueError("When specifying _scheme, _external must be True")
@@ -657,6 +1072,9 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                     scheme = netloc[:8].split(":", 1)[0]
                 else:
                     scheme = "http"
+                # Replace http/https with ws/wss for WebSocket handlers
+                if route.extra.websocket:
+                    scheme = scheme.replace("http", "ws")
 
             if "://" in netloc[:8]:
                 netloc = netloc.split("://", 1)[-1]
@@ -686,7 +1104,7 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                 )
                 passes_pattern = pattern.match(supplied_param)
                 if not passes_pattern:
-                    if param_info.cast != str:
+                    if param_info.cast is not str:
                         msg = (
                             f'Value "{supplied_param}" '
                             f"for parameter `{param_info.name}` does "
@@ -718,29 +1136,83 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
     # -------------------------------------------------------------------- #
 
     async def handle_exception(
-        self, request: Request, exception: BaseException
-    ):  # no cov
-        """
-        A handler that catches specific exceptions and outputs a response.
+        self,
+        request: Request,
+        exception: BaseException,
+        run_middleware: bool = True,
+    ) -> None:  # no cov
+        """A handler that catches specific exceptions and outputs a response.
 
-        :param request: The current request object
-        :type request: :class:`SanicASGITestClient`
-        :param exception: The exception that was raised
-        :type exception: BaseException
-        :raises ServerError: response 500
+        .. note::
+            This method is typically used internally, and you should not need
+            to call it directly.
+
+        Args:
+            request (Request): The current request object.
+            exception (BaseException): The exception that was raised.
+            run_middleware (bool): Whether to run middleware. Defaults
+                to `True`.
+
+        Raises:
+            ServerError: response 500.
         """
+        response = None
+        if not getattr(exception, "__dispatched__", False):
+            ...  # DO NOT REMOVE THIS LINE. IT IS NEEDED FOR TOUCHUP.
+            await self.dispatch(
+                "server.exception.report",
+                context={"exception": exception},
+            )
         await self.dispatch(
             "http.lifecycle.exception",
             inline=True,
             context={"request": request, "exception": exception},
         )
 
+        if (
+            request.stream is not None
+            and request.stream.stage is not Stage.HANDLER
+        ):
+            error_logger.exception(exception, exc_info=True)
+            logger.error(
+                "The error response will not be sent to the client for "
+                f'the following exception:"{exception}". A previous response '
+                "has at least partially been sent."
+            )
+
+            handler = self.error_handler._lookup(
+                exception, request.name if request else None
+            )
+            if handler:
+                logger.warning(
+                    "An error occurred while handling the request after at "
+                    "least some part of the response was sent to the client. "
+                    "The response from your custom exception handler "
+                    f"{handler.__name__} will not be sent to the client."
+                    "Exception handlers should only be used to generate the "
+                    "exception responses. If you would like to perform any "
+                    "other action on a raised exception, consider using a "
+                    "signal handler like "
+                    '`@app.signal("http.lifecycle.exception")`\n'
+                    "For further information, please see the docs: "
+                    "https://sanicframework.org/en/guide/advanced/"
+                    "signals.html",
+                )
+            return
+
         # -------------------------------------------- #
         # Request Middleware
         # -------------------------------------------- #
-        response = await self._run_request_middleware(
-            request, request_name=None
-        )
+        if run_middleware:
+            try:
+                middleware = (
+                    request.route and request.route.extra.request_middleware
+                ) or self.request_middleware
+                response = await self._run_request_middleware(
+                    request, middleware
+                )
+            except Exception as e:
+                return await self.handle_exception(request, e, False)
         # No middleware results
         if not response:
             try:
@@ -764,6 +1236,7 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                     )
         if response is not None:
             try:
+                request.reset_response()
                 response = await request.respond(response)
             except BaseException:
                 # Skip response middleware
@@ -774,6 +1247,9 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         else:
             if request.stream:
                 response = request.stream.response
+
+        # Marked for cleanup and DRY with handle_request/handle_exception
+        # when ResponseStream is no longer supporder
         if isinstance(response, BaseHTTPResponse):
             await self.dispatch(
                 "http.lifecycle.response",
@@ -784,19 +1260,37 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                 },
             )
             await response.send(end_stream=True)
+        elif isinstance(response, ResponseStream):
+            resp = await response(request)
+            await self.dispatch(
+                "http.lifecycle.response",
+                inline=True,
+                context={
+                    "request": request,
+                    "response": resp,
+                },
+            )
+            await response.eof()
         else:
             raise ServerError(
                 f"Invalid response type {response!r} (need HTTPResponse)"
             )
 
-    async def handle_request(self, request: Request):  # no cov
-        """Take a request from the HTTP Server and return a response object
-        to be sent back The HTTP Server only expects a response object, so
-        exception handling must be done here
+    async def handle_request(self, request: Request) -> None:  # no cov
+        """Handles a request by dispatching it to the appropriate handler.
 
-        :param request: HTTP Request object
-        :return: Nothing
+        .. note::
+            This method is typically used internally, and you should not need
+            to call it directly.
+
+        Args:
+            request (Request): The current request object.
+
+        Raises:
+            ServerError: response 500.
         """
+        __tracebackhide__ = True
+
         await self.dispatch(
             "http.lifecycle.handle",
             inline=True,
@@ -805,9 +1299,15 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
 
         # Define `response` var here to remove warnings about
         # allocation before assignment below.
-        response = None
+        response: Optional[
+            Union[
+                BaseHTTPResponse,
+                Coroutine[Any, Any, Optional[BaseHTTPResponse]],
+                ResponseStream,
+            ]
+        ] = None
+        run_middleware = True
         try:
-
             await self.dispatch(
                 "http.routing.before",
                 inline=True,
@@ -837,9 +1337,8 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             if (
                 request.stream
                 and request.stream.request_body
-                and not route.ctx.ignore_body
+                and not route.extra.ignore_body
             ):
-
                 if hasattr(handler, "is_stream"):
                     # Streaming handler: lift the size limit
                     request.stream.request_max_size = float("inf")
@@ -850,9 +1349,11 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             # -------------------------------------------- #
             # Request Middleware
             # -------------------------------------------- #
-            response = await self._run_request_middleware(
-                request, request_name=route.name
-            )
+            run_middleware = False
+            if request.route.extra.request_middleware:
+                response = await self._run_request_middleware(
+                    request, request.route.extra.request_middleware
+                )
 
             # No middleware results
             if not response:
@@ -862,23 +1363,41 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
 
                 if handler is None:
                     raise ServerError(
-                        (
-                            "'None' was returned while requesting a "
-                            "handler from the router"
-                        )
+                        "'None' was returned while requesting a "
+                        "handler from the router"
                     )
 
                 # Run response handler
+                await self.dispatch(
+                    "http.handler.before",
+                    inline=True,
+                    context={"request": request},
+                )
                 response = handler(request, **request.match_info)
                 if isawaitable(response):
                     response = await response
+                await self.dispatch(
+                    "http.handler.after",
+                    inline=True,
+                    context={"request": request},
+                )
 
-            if response is not None:
-                response = await request.respond(response)
+            if request.responded:
+                if response is not None:
+                    error_logger.error(
+                        "The response object returned by the route handler "
+                        "will not be sent to client. The request has already "
+                        "been responded to."
+                    )
+                if request.stream is not None:
+                    response = request.stream.response
+            elif response is not None:
+                response = await request.respond(response)  # type: ignore
             elif not hasattr(handler, "is_websocket"):
                 response = request.stream.response  # type: ignore
 
-            # Make sure that response is finished / run StreamingHTTP callback
+            # Marked for cleanup and DRY with handle_request/handle_exception
+            # when ResponseStream is no longer supporder
             if isinstance(response, BaseHTTPResponse):
                 await self.dispatch(
                     "http.lifecycle.response",
@@ -888,7 +1407,19 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                         "response": response,
                     },
                 )
+                ...
                 await response.send(end_stream=True)
+            elif isinstance(response, ResponseStream):
+                resp = await response(request)
+                await self.dispatch(
+                    "http.lifecycle.response",
+                    inline=True,
+                    context={
+                        "request": request,
+                        "response": resp,
+                    },
+                )
+                await response.eof()
             else:
                 if not hasattr(handler, "is_websocket"):
                     raise ServerError(
@@ -896,11 +1427,13 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                         "(need HTTPResponse)"
                     )
 
-        except CancelledError:
+        except CancelledError:  # type: ignore
             raise
         except Exception as e:
             # Response Generation Failed
-            await self.handle_exception(request, e)
+            await self.handle_exception(
+                request, e, run_middleware=run_middleware
+            )
 
     async def _websocket_handler(
         self, handler, request, *args, subprotocols=None, **kwargs
@@ -912,6 +1445,12 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             protocol = request.transport.get_protocol()
             ws = await protocol.websocket_handshake(request, subprotocols)
 
+        await self.dispatch(
+            "websocket.handler.before",
+            inline=True,
+            context={"request": request, "websocket": ws},
+            fail_not_found=False,
+        )
         # schedule the application handler
         # its future is kept in self.websocket_tasks in case it
         # needs to be cancelled due to the server being stopped
@@ -920,10 +1459,24 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         cancelled = False
         try:
             await fut
+            await self.dispatch(
+                "websocket.handler.after",
+                inline=True,
+                context={"request": request, "websocket": ws},
+                reverse=True,
+                fail_not_found=False,
+            )
+        except (CancelledError, ConnectionClosed):  # type: ignore
+            cancelled = True
         except Exception as e:
             self.error_handler.log(request, e)
-        except (CancelledError, ConnectionClosed):
-            cancelled = True
+            await self.dispatch(
+                "websocket.handler.exception",
+                inline=True,
+                context={"request": request, "websocket": ws, "exception": e},
+                reverse=True,
+                fail_not_found=False,
+            )
         finally:
             self.websocket_tasks.remove(fut)
             if cancelled:
@@ -936,7 +1489,16 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
     # -------------------------------------------------------------------- #
 
     @property
-    def test_client(self):  # noqa
+    def test_client(self) -> SanicTestClient:  # type: ignore # noqa
+        """A testing client that uses httpx and a live running server to reach into the application to execute handlers.
+
+        This property is available if the `sanic-testing` package is installed.
+
+        See [Test Clients](/en/plugins/sanic-testing/clients#wsgi-client-sanictestclient) for details.
+
+        Returns:
+            SanicTestClient: A testing client from the `sanic-testing` package.
+        """  # noqa: E501
         if self._test_client:
             return self._test_client
         elif self._test_manager:
@@ -947,14 +1509,16 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         return self._test_client
 
     @property
-    def asgi_client(self):  # noqa
-        """
-        A testing client that uses ASGI to reach into the application to
-        execute hanlers.
+    def asgi_client(self) -> SanicASGITestClient:  # type: ignore # noqa
+        """A testing client that uses ASGI to reach into the application to execute handlers.
 
-        :return: testing client
-        :rtype: :class:`SanicASGITestClient`
-        """
+        This property is available if the `sanic-testing` package is installed.
+
+        See [Test Clients](/en/plugins/sanic-testing/clients#asgi-async-client-sanicasgitestclient) for details.
+
+        Returns:
+            SanicASGITestClient: A testing client from the `sanic-testing` package.
+        """  # noqa: E501
         if self._asgi_client:
             return self._asgi_client
         elif self._test_manager:
@@ -968,453 +1532,78 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
     # Execution
     # -------------------------------------------------------------------- #
 
-    def make_coffee(self, *args, **kwargs):
-        self.state.coffee = True
-        self.run(*args, **kwargs)
-
-    def run(
-        self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        *,
-        debug: bool = False,
-        auto_reload: Optional[bool] = None,
-        ssl: Union[None, SSLContext, dict, str, list, tuple] = None,
-        sock: Optional[socket] = None,
-        workers: int = 1,
-        protocol: Optional[Type[Protocol]] = None,
-        backlog: int = 100,
-        register_sys_signals: bool = True,
-        access_log: Optional[bool] = None,
-        unix: Optional[str] = None,
-        loop: AbstractEventLoop = None,
-        reload_dir: Optional[Union[List[str], str]] = None,
-        noisy_exceptions: Optional[bool] = None,
-        motd: bool = True,
-        fast: bool = False,
-        verbosity: int = 0,
-        motd_display: Optional[Dict[str, str]] = None,
-    ) -> None:
-        """
-        Run the HTTP Server and listen until keyboard interrupt or term
-        signal. On termination, drain connections before closing.
-
-        :param host: Address to host on
-        :type host: str
-        :param port: Port to host on
-        :type port: int
-        :param debug: Enables debug output (slows server)
-        :type debug: bool
-        :param auto_reload: Reload app whenever its source code is changed.
-                            Enabled by default in debug mode.
-        :type auto_relaod: bool
-        :param ssl: SSLContext, or location of certificate and key
-                    for SSL encryption of worker(s)
-        :type ssl: str, dict, SSLContext or list
-        :param sock: Socket for the server to accept connections from
-        :type sock: socket
-        :param workers: Number of processes received before it is respected
-        :type workers: int
-        :param protocol: Subclass of asyncio Protocol class
-        :type protocol: type[Protocol]
-        :param backlog: a number of unaccepted connections that the system
-                        will allow before refusing new connections
-        :type backlog: int
-        :param register_sys_signals: Register SIG* events
-        :type register_sys_signals: bool
-        :param access_log: Enables writing access logs (slows server)
-        :type access_log: bool
-        :param unix: Unix socket to listen on instead of TCP port
-        :type unix: str
-        :param noisy_exceptions: Log exceptions that are normally considered
-                                 to be quiet/silent
-        :type noisy_exceptions: bool
-        :return: Nothing
-        """
-        self.state.verbosity = verbosity
-
-        if fast and workers != 1:
-            raise RuntimeError("You cannot use both fast=True and workers=X")
-
-        if motd_display:
-            self.config.MOTD_DISPLAY.update(motd_display)
-
-        if reload_dir:
-            if isinstance(reload_dir, str):
-                reload_dir = [reload_dir]
-
-            for directory in reload_dir:
-                direc = Path(directory)
-                if not direc.is_dir():
-                    logger.warning(
-                        f"Directory {directory} could not be located"
-                    )
-                self.state.reload_dirs.add(Path(directory))
-
-        if loop is not None:
-            raise TypeError(
-                "loop is not a valid argument. To use an existing loop, "
-                "change to create_server().\nSee more: "
-                "https://sanic.readthedocs.io/en/latest/sanic/deploying.html"
-                "#asynchronous-support"
-            )
-
-        if auto_reload or auto_reload is None and debug:
-            auto_reload = True
-            if os.environ.get("SANIC_SERVER_RUNNING") != "true":
-                return reloader_helpers.watchdog(1.0, self)
-
-        if sock is None:
-            host, port = host or "127.0.0.1", port or 8000
-
-        if protocol is None:
-            protocol = (
-                WebSocketProtocol if self.websocket_enabled else HttpProtocol
-            )
-
-        # Set explicitly passed configuration values
-        for attribute, value in {
-            "ACCESS_LOG": access_log,
-            "AUTO_RELOAD": auto_reload,
-            "MOTD": motd,
-            "NOISY_EXCEPTIONS": noisy_exceptions,
-        }.items():
-            if value is not None:
-                setattr(self.config, attribute, value)
-
-        if fast:
-            self.state.fast = True
-            try:
-                workers = len(os.sched_getaffinity(0))
-            except AttributeError:
-                workers = os.cpu_count() or 1
-
-        server_settings = self._helper(
-            host=host,
-            port=port,
-            debug=debug,
-            ssl=ssl,
-            sock=sock,
-            unix=unix,
-            workers=workers,
-            protocol=protocol,
-            backlog=backlog,
-            register_sys_signals=register_sys_signals,
-        )
-
-        try:
-            self.is_running = True
-            self.is_stopping = False
-            if workers > 1 and os.name != "posix":
-                logger.warn(
-                    f"Multiprocessing is currently not supported on {os.name},"
-                    " using workers=1 instead"
-                )
-                workers = 1
-            if workers == 1:
-                serve_single(server_settings)
-            else:
-                serve_multiple(server_settings, workers)
-        except BaseException:
-            error_logger.exception(
-                "Experienced exception while trying to serve"
-            )
-            raise
-        finally:
-            self.is_running = False
-        logger.info("Server Stopped")
-
-    def stop(self):
-        """
-        This kills the Sanic
-        """
-        if not self.is_stopping:
-            self.is_stopping = True
-            get_event_loop().stop()
-
-    async def create_server(
-        self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        *,
-        debug: bool = False,
-        ssl: Union[None, SSLContext, dict, str, list, tuple] = None,
-        sock: Optional[socket] = None,
-        protocol: Type[Protocol] = None,
-        backlog: int = 100,
-        access_log: Optional[bool] = None,
-        unix: Optional[str] = None,
-        return_asyncio_server: bool = False,
-        asyncio_server_kwargs: Dict[str, Any] = None,
-        noisy_exceptions: Optional[bool] = None,
-    ) -> Optional[AsyncioServer]:
-        """
-        Asynchronous version of :func:`run`.
-
-        This method will take care of the operations necessary to invoke
-        the *before_start* events via :func:`trigger_events` method invocation
-        before starting the *sanic* app in Async mode.
-
-        .. note::
-            This does not support multiprocessing and is not the preferred
-            way to run a :class:`Sanic` application.
-
-        :param host: Address to host on
-        :type host: str
-        :param port: Port to host on
-        :type port: int
-        :param debug: Enables debug output (slows server)
-        :type debug: bool
-        :param ssl: SSLContext, or location of certificate and key
-                    for SSL encryption of worker(s)
-        :type ssl: SSLContext or dict
-        :param sock: Socket for the server to accept connections from
-        :type sock: socket
-        :param protocol: Subclass of asyncio Protocol class
-        :type protocol: type[Protocol]
-        :param backlog: a number of unaccepted connections that the system
-                        will allow before refusing new connections
-        :type backlog: int
-        :param access_log: Enables writing access logs (slows server)
-        :type access_log: bool
-        :param return_asyncio_server: flag that defines whether there's a need
-                                      to return asyncio.Server or
-                                      start it serving right away
-        :type return_asyncio_server: bool
-        :param asyncio_server_kwargs: key-value arguments for
-                                      asyncio/uvloop create_server method
-        :type asyncio_server_kwargs: dict
-        :param noisy_exceptions: Log exceptions that are normally considered
-                                 to be quiet/silent
-        :type noisy_exceptions: bool
-        :return: AsyncioServer if return_asyncio_server is true, else Nothing
-        """
-
-        if sock is None:
-            host, port = host or "127.0.0.1", port or 8000
-
-        if protocol is None:
-            protocol = (
-                WebSocketProtocol if self.websocket_enabled else HttpProtocol
-            )
-
-        # if access_log is passed explicitly change config.ACCESS_LOG
-        if access_log is not None:
-            self.config.ACCESS_LOG = access_log
-
-        if noisy_exceptions is not None:
-            self.config.NOISY_EXCEPTIONS = noisy_exceptions
-
-        server_settings = self._helper(
-            host=host,
-            port=port,
-            debug=debug,
-            ssl=ssl,
-            sock=sock,
-            unix=unix,
-            loop=get_event_loop(),
-            protocol=protocol,
-            backlog=backlog,
-            run_async=return_asyncio_server,
-        )
-
-        main_start = server_settings.pop("main_start", None)
-        main_stop = server_settings.pop("main_stop", None)
-        if main_start or main_stop:
-            logger.warning(
-                "Listener events for the main process are not available "
-                "with create_server()"
-            )
-
-        return await serve(
-            asyncio_server_kwargs=asyncio_server_kwargs, **server_settings
-        )
-
     async def _run_request_middleware(
-        self, request, request_name=None
+        self, request, middleware_collection
     ):  # no cov
-        # The if improves speed.  I don't know why
-        named_middleware = self.named_request_middleware.get(
-            request_name, deque()
-        )
-        applicable_middleware = self.request_middleware + named_middleware
+        request._request_middleware_started = True
 
-        # request.request_middleware_started is meant as a stop-gap solution
-        # until RFC 1630 is adopted
-        if applicable_middleware and not request.request_middleware_started:
-            request.request_middleware_started = True
+        for middleware in middleware_collection:
+            await self.dispatch(
+                "http.middleware.before",
+                inline=True,
+                context={
+                    "request": request,
+                    "response": None,
+                },
+                condition={"attach_to": "request"},
+            )
 
-            for middleware in applicable_middleware:
-                await self.dispatch(
-                    "http.middleware.before",
-                    inline=True,
-                    context={
-                        "request": request,
-                        "response": None,
-                    },
-                    condition={"attach_to": "request"},
-                )
+            response = middleware(request)
+            if isawaitable(response):
+                response = await response
 
-                response = middleware(request)
-                if isawaitable(response):
-                    response = await response
+            await self.dispatch(
+                "http.middleware.after",
+                inline=True,
+                context={
+                    "request": request,
+                    "response": None,
+                },
+                condition={"attach_to": "request"},
+            )
 
-                await self.dispatch(
-                    "http.middleware.after",
-                    inline=True,
-                    context={
-                        "request": request,
-                        "response": None,
-                    },
-                    condition={"attach_to": "request"},
-                )
-
-                if response:
-                    return response
+            if response:
+                return response
         return None
 
     async def _run_response_middleware(
-        self, request, response, request_name=None
+        self, request, response, middleware_collection
     ):  # no cov
-        named_middleware = self.named_response_middleware.get(
-            request_name, deque()
-        )
-        applicable_middleware = self.response_middleware + named_middleware
-        if applicable_middleware:
-            for middleware in applicable_middleware:
-                await self.dispatch(
-                    "http.middleware.before",
-                    inline=True,
-                    context={
-                        "request": request,
-                        "response": response,
-                    },
-                    condition={"attach_to": "response"},
-                )
+        for middleware in middleware_collection:
+            await self.dispatch(
+                "http.middleware.before",
+                inline=True,
+                context={
+                    "request": request,
+                    "response": response,
+                },
+                condition={"attach_to": "response"},
+            )
 
-                _response = middleware(request, response)
-                if isawaitable(_response):
-                    _response = await _response
+            _response = middleware(request, response)
+            if isawaitable(_response):
+                _response = await _response
 
-                await self.dispatch(
-                    "http.middleware.after",
-                    inline=True,
-                    context={
-                        "request": request,
-                        "response": _response if _response else response,
-                    },
-                    condition={"attach_to": "response"},
-                )
+            await self.dispatch(
+                "http.middleware.after",
+                inline=True,
+                context={
+                    "request": request,
+                    "response": _response if _response else response,
+                },
+                condition={"attach_to": "response"},
+            )
 
-                if _response:
-                    response = _response
-                    if isinstance(response, BaseHTTPResponse):
-                        response = request.stream.respond(response)
-                    break
+            if _response:
+                response = _response
+                if isinstance(response, BaseHTTPResponse):
+                    response = request.stream.respond(response)
+                break
         return response
-
-    def _helper(
-        self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        debug: bool = False,
-        ssl: Union[None, SSLContext, dict, str, list, tuple] = None,
-        sock: Optional[socket] = None,
-        unix: Optional[str] = None,
-        workers: int = 1,
-        loop: AbstractEventLoop = None,
-        protocol: Type[Protocol] = HttpProtocol,
-        backlog: int = 100,
-        register_sys_signals: bool = True,
-        run_async: bool = False,
-    ):
-        """Helper function used by `run` and `create_server`."""
-        if self.config.PROXIES_COUNT and self.config.PROXIES_COUNT < 0:
-            raise ValueError(
-                "PROXIES_COUNT cannot be negative. "
-                "https://sanic.readthedocs.io/en/latest/sanic/config.html"
-                "#proxy-configuration"
-            )
-
-        self.debug = debug
-        self.state.host = host
-        self.state.port = port
-        self.state.workers = workers
-
-        # Serve
-        serve_location = ""
-        proto = "http"
-        if ssl is not None:
-            proto = "https"
-        if unix:
-            serve_location = f"{unix} {proto}://..."
-        elif sock:
-            serve_location = f"{sock.getsockname()} {proto}://..."
-        elif host and port:
-            # colon(:) is legal for a host only in an ipv6 address
-            display_host = f"[{host}]" if ":" in host else host
-            serve_location = f"{proto}://{display_host}:{port}"
-
-        ssl = process_to_context(ssl)
-
-        server_settings = {
-            "protocol": protocol,
-            "host": host,
-            "port": port,
-            "sock": sock,
-            "unix": unix,
-            "ssl": ssl,
-            "app": self,
-            "signal": ServerSignal(),
-            "loop": loop,
-            "register_sys_signals": register_sys_signals,
-            "backlog": backlog,
-        }
-
-        self.motd(serve_location)
-
-        if sys.stdout.isatty() and not self.state.is_debug:
-            error_logger.warning(
-                f"{Colors.YELLOW}Sanic is running in PRODUCTION mode. "
-                "Consider using '--debug' or '--dev' while actively "
-                f"developing your application.{Colors.END}"
-            )
-
-        # Register start/stop events
-        for event_name, settings_name, reverse in (
-            ("main_process_start", "main_start", False),
-            ("main_process_stop", "main_stop", True),
-        ):
-            listeners = self.listeners[event_name].copy()
-            if reverse:
-                listeners.reverse()
-            # Prepend sanic to the arguments when listeners are triggered
-            listeners = [partial(listener, self) for listener in listeners]
-            server_settings[settings_name] = listeners  # type: ignore
-
-        if run_async:
-            server_settings["run_async"] = True
-
-        return server_settings
 
     def _build_endpoint_name(self, *parts):
         parts = [self.name, *parts]
         return ".".join(parts)
-
-    @classmethod
-    def _prep_task(cls, task, app, loop):
-        if callable(task):
-            try:
-                task = task(app)
-            except TypeError:
-                task = task()
-
-        return task
-
-    @classmethod
-    def _loop_add_task(cls, task, app, loop):
-        prepped = cls._prep_task(task, app, loop)
-        loop.create_task(prepped)
 
     @classmethod
     def _cancel_websocket_tasks(cls, app, loop):
@@ -1422,23 +1611,314 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             task.cancel()
 
     @staticmethod
-    async def dispatch_delayed_tasks(app, loop):
+    async def _listener(
+        app: Sanic, loop: AbstractEventLoop, listener: ListenerType
+    ):
+        try:
+            maybe_coro = listener(app)  # type: ignore
+        except TypeError:
+            maybe_coro = listener(app, loop)  # type: ignore
+        if maybe_coro and isawaitable(maybe_coro):
+            await maybe_coro
+
+    # -------------------------------------------------------------------- #
+    # Task management
+    # -------------------------------------------------------------------- #
+
+    @classmethod
+    def _prep_task(
+        cls,
+        task,
+        app,
+        loop,
+    ):
+        async def do(task):
+            try:
+                if callable(task):
+                    try:
+                        task = task(app)
+                    except TypeError:
+                        task = task()
+                if isawaitable(task):
+                    await task
+            except CancelledError:
+                error_logger.warning(
+                    f"Task {task} was cancelled before it completed."
+                )
+                raise
+            except Exception as e:
+                await app.dispatch(
+                    "server.exception.report",
+                    context={"exception": e},
+                )
+                raise
+
+        return do(task)
+
+    @classmethod
+    def _loop_add_task(
+        cls,
+        task,
+        app,
+        loop,
+        *,
+        name: Optional[str] = None,
+        register: bool = True,
+    ) -> Task:
+        tsk: Task = task
+        if not isinstance(task, Future):
+            prepped = cls._prep_task(task, app, loop)
+            tsk = loop.create_task(prepped, name=name)
+
+        if name and register:
+            app._task_registry[name] = tsk
+
+        return tsk
+
+    @staticmethod
+    async def dispatch_delayed_tasks(
+        app: Sanic,
+        loop: AbstractEventLoop,
+    ) -> None:
+        """Signal handler for dispatching delayed tasks.
+
+        This is used to dispatch tasks that were added before the loop was
+        started, and will be called after the loop has started. It is
+        not typically used directly.
+
+        Args:
+            app (Sanic): The Sanic application instance.
+            loop (AbstractEventLoop): The event loop in which the tasks are
+                being run.
+
+        Returns:
+            None
+        """
         for name in app._delayed_tasks:
             await app.dispatch(name, context={"app": app, "loop": loop})
         app._delayed_tasks.clear()
 
     @staticmethod
-    async def run_delayed_task(app, loop, task):
+    async def run_delayed_task(
+        app: Sanic,
+        loop: AbstractEventLoop,
+        task: Union[Future[Any], Task[Any], Awaitable[Any]],
+    ) -> None:
+        """Executes a delayed task within the context of a given app and loop.
+
+        This method prepares a given task by invoking the app's private
+        `_prep_task` method and then awaits the execution of the prepared task.
+
+        Args:
+            app (Any): The application instance on which the task will
+                be executed.
+            loop (AbstractEventLoop): The event loop where the task will
+                be scheduled.
+            task (Task[Any]): The task function that will be prepared
+                and executed.
+
+        Returns:
+            None
+        """
         prepped = app._prep_task(task, app, loop)
         await prepped
 
-    @staticmethod
-    async def _listener(
-        app: Sanic, loop: AbstractEventLoop, listener: ListenerType
-    ):
-        maybe_coro = listener(app, loop)
-        if maybe_coro and isawaitable(maybe_coro):
-            await maybe_coro
+    def add_task(
+        self,
+        task: Union[Future[Any], Coroutine[Any, Any, Any], Awaitable[Any]],
+        *,
+        name: Optional[str] = None,
+        register: bool = True,
+    ) -> Optional[Task[Any]]:
+        """Schedule a task to run later, after the loop has started.
+
+        While this is somewhat similar to `asyncio.create_task`, it can be
+        used before the loop has started (in which case it will run after the
+        loop has started in the `before_server_start` listener).
+
+        Naming tasks is a good practice as it allows you to cancel them later,
+        and allows Sanic to manage them when the server is stopped, if needed.
+
+        [See user guide re: background tasks](/en/guide/basics/tasks#background-tasks)
+
+        Args:
+            task (Union[Future[Any], Coroutine[Any, Any, Any], Awaitable[Any]]):
+                The future, coroutine, or awaitable to schedule.
+            name (Optional[str], optional): The name of the task, if needed for
+                later reference. Defaults to `None`.
+            register (bool, optional): Whether to register the task. Defaults
+                to `True`.
+
+        Returns:
+            Optional[Task[Any]]: The task that was scheduled, if applicable.
+        """  # noqa: E501
+        try:
+            loop = self.loop  # Will raise SanicError if loop is not started
+            return self._loop_add_task(
+                task, self, loop, name=name, register=register
+            )
+        except SanicException:
+            task_name = f"sanic.delayed_task.{hash(task)}"
+            if not self._delayed_tasks:
+                self.after_server_start(partial(self.dispatch_delayed_tasks))
+
+            if name:
+                raise RuntimeError(
+                    "Cannot name task outside of a running application"
+                )
+
+            self.signal(task_name)(partial(self.run_delayed_task, task=task))
+            self._delayed_tasks.append(task_name)
+            return None
+
+    @overload
+    def get_task(
+        self, name: str, *, raise_exception: Literal[True]
+    ) -> Task: ...
+
+    @overload
+    def get_task(
+        self, name: str, *, raise_exception: Literal[False]
+    ) -> Optional[Task]: ...
+
+    @overload
+    def get_task(
+        self, name: str, *, raise_exception: bool
+    ) -> Optional[Task]: ...
+
+    def get_task(
+        self, name: str, *, raise_exception: bool = True
+    ) -> Optional[Task]:
+        """Get a named task.
+
+        This method is used to get a task by its name. Optionally, you can
+        control whether an exception should be raised if the task is not found.
+
+        Args:
+            name (str): The name of the task to be retrieved.
+            raise_exception (bool): If `True`, an exception will be raised if
+                the task is not found. Defaults to `True`.
+
+        Returns:
+            Optional[Task]: The task, if found.
+        """
+        try:
+            return self._task_registry[name]
+        except KeyError:
+            if raise_exception:
+                raise SanicException(
+                    f'Registered task named "{name}" not found.'
+                )
+            return None
+
+    async def cancel_task(
+        self,
+        name: str,
+        msg: Optional[str] = None,
+        *,
+        raise_exception: bool = True,
+    ) -> None:
+        """Cancel a named task.
+
+        This method is used to cancel a task by its name. Optionally, you can
+        provide a message that describes why the task was canceled, and control
+        whether an exception should be raised if the task is not found.
+
+        Args:
+            name (str): The name of the task to be canceled.
+            msg (Optional[str]): Optional message describing why the task was canceled. Defaults to None.
+            raise_exception (bool): If True, an exception will be raised if the task is not found. Defaults to True.
+
+        Example:
+            ```python
+            async def my_task():
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError as e:
+                    current_task = asyncio.current_task()
+                    print(f"Task {current_task.get_name()} was cancelled. {e}")
+                    # Task sleepy_task was cancelled. No more sleeping!
+
+
+            @app.before_server_start
+            async def before_start(app):
+                app.add_task(my_task, name="sleepy_task")
+                await asyncio.sleep(1)
+                await app.cancel_task("sleepy_task", msg="No more sleeping!")
+            ```
+        """  # noqa: E501
+        task = self.get_task(name, raise_exception=raise_exception)
+        if task and not task.cancelled():
+            args: tuple[str, ...] = ()
+            if msg:
+                args = (msg,)
+            task.cancel(*args)
+            try:
+                await task
+            except CancelledError:
+                ...
+
+    def purge_tasks(self) -> None:
+        """Purges completed and cancelled tasks from the task registry.
+
+        This method iterates through the task registry, identifying any tasks
+        that are either done or cancelled, and then removes those tasks,
+        leaving only the pending tasks in the registry.
+        """
+        for key, task in self._task_registry.items():
+            if task is None:
+                continue
+            if task.done() or task.cancelled():
+                self._task_registry[key] = None
+
+        self._task_registry = {
+            k: v for k, v in self._task_registry.items() if v is not None
+        }
+
+    def shutdown_tasks(
+        self, timeout: Optional[float] = None, increment: float = 0.1
+    ) -> None:
+        """Cancel all tasks except the server task.
+
+        This method is used to cancel all tasks except the server task. It
+        iterates through the task registry, cancelling all tasks except the
+        server task, and then waits for the tasks to complete. Optionally, you
+        can provide a timeout and an increment to control how long the method
+        will wait for the tasks to complete.
+
+        Args:
+            timeout (Optional[float]): The amount of time to wait for the tasks
+                to complete. Defaults to `None`.
+            increment (float): The amount of time to wait between checks for
+                whether the tasks have completed. Defaults to `0.1`.
+        """
+        for task in self.tasks:
+            if task.get_name() != "RunServer":
+                task.cancel()
+
+        if timeout is None:
+            timeout = self.config.GRACEFUL_SHUTDOWN_TIMEOUT
+
+        while len(self._task_registry) and timeout:
+            with suppress(RuntimeError):
+                running_loop = get_running_loop()
+                running_loop.run_until_complete(asyncio.sleep(increment))
+            self.purge_tasks()
+            timeout -= increment
+
+    @property
+    def tasks(self) -> Iterable[Task[Any]]:
+        """The tasks that are currently registered with the application.
+
+        Returns:
+            Iterable[Task[Any]]: The tasks that are currently registered with
+                the application.
+        """
+        return (
+            task
+            for task in iter(self._task_registry.values())
+            if task is not None
+        )
 
     # -------------------------------------------------------------------- #
     # ASGI
@@ -1450,11 +1930,15 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         three arguments: scope, receive, send. See the ASGI reference for more
         details: https://asgi.readthedocs.io/en/latest
         """
-        self.asgi = True
-        self.motd("")
-        self._asgi_app = await ASGIApp.create(self, scope, receive, send)
-        asgi_app = self._asgi_app
-        await asgi_app()
+        if scope["type"] == "lifespan":
+            setup_logging(self.state.is_debug, self.config.NO_COLOR)
+            self.asgi = True
+            self.motd("")
+            self._asgi_lifespan = Lifespan(self, scope, receive, send)
+            await self._asgi_lifespan()
+        else:
+            self._asgi_app = await ASGIApp.create(self, scope, receive, send)
+            await self._asgi_app()
 
     _asgi_single_callable = True  # We conform to ASGI 3.0 single-callable
 
@@ -1462,18 +1946,25 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
     # Configuration
     # -------------------------------------------------------------------- #
 
-    def update_config(self, config: Union[bytes, str, dict, Any]):
-        """
-        Update app.config. Full implementation can be found in the user guide.
+    def update_config(self, config: Union[bytes, str, dict, Any]) -> None:
+        """Update the application configuration.
 
-        `See user guide re: configuration
-        <https://sanicframework.org/guide/deployment/configuration.html#basics>`__
+        This method is used to update the application configuration. It can
+        accept a configuration object, a dictionary, or a path to a file that
+        contains a configuration object or dictionary.
+
+        See [Configuration](/en/guide/deployment/configuration) for details.
+
+        Args:
+            config (Union[bytes, str, dict, Any]): The configuration object,
+                dictionary, or path to a configuration file.
         """
 
         self.config.update_config(config)
 
     @property
-    def asgi(self):
+    def asgi(self) -> bool:
+        """Whether the app is running in ASGI mode."""
         return self.state.asgi
 
     @asgi.setter
@@ -1481,113 +1972,157 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         self.state.asgi = value
 
     @property
-    def debug(self):
+    def debug(self) -> bool:
+        """Whether the app is running in debug mode."""
         return self.state.is_debug
 
-    @debug.setter
-    def debug(self, value: bool):
-        mode = Mode.DEBUG if value else Mode.PRODUCTION
-        self.state.mode = mode
-
     @property
-    def auto_reload(self):
+    def auto_reload(self) -> bool:
+        """Whether the app is running in auto-reload mode."""
         return self.config.AUTO_RELOAD
 
     @auto_reload.setter
     def auto_reload(self, value: bool):
         self.config.AUTO_RELOAD = value
+        self.state.auto_reload = value
 
     @property
-    def state(self):
+    def state(self) -> ApplicationState:  # type: ignore
+        """The application state.
+
+        Returns:
+            ApplicationState: The current state of the application.
+        """
         return self._state
 
     @property
-    def is_running(self):
-        return self.state.is_running
+    def reload_dirs(self) -> set[Path]:
+        """The directories that are monitored for auto-reload.
 
-    @is_running.setter
-    def is_running(self, value: bool):
-        self.state.is_running = value
-
-    @property
-    def is_stopping(self):
-        return self.state.is_stopping
-
-    @is_stopping.setter
-    def is_stopping(self, value: bool):
-        self.state.is_stopping = value
-
-    @property
-    def reload_dirs(self):
+        Returns:
+            Set[str]: The set of directories that are monitored for
+                auto-reload.
+        """
         return self.state.reload_dirs
 
-    def motd(self, serve_location):
-        if self.config.MOTD:
-            mode = [f"{self.state.mode},"]
-            if self.state.fast:
-                mode.append("goin' fast")
-            if self.state.asgi:
-                mode.append("ASGI")
-            else:
-                if self.state.workers == 1:
-                    mode.append("single worker")
-                else:
-                    mode.append(f"w/ {self.state.workers} workers")
+    # -------------------------------------------------------------------- #
+    # Sanic Extensions
+    # -------------------------------------------------------------------- #
 
-            display = {
-                "mode": " ".join(mode),
-                "server": self.state.server,
-                "python": platform.python_version(),
-                "platform": platform.platform(),
-            }
-            extra = {}
-            if self.config.AUTO_RELOAD:
-                reload_display = "enabled"
-                if self.state.reload_dirs:
-                    reload_display += ", ".join(
-                        [
-                            "",
-                            *(
-                                str(path.absolute())
-                                for path in self.state.reload_dirs
-                            ),
-                        ]
-                    )
-                display["auto-reload"] = reload_display
+    @property
+    def ext(self) -> Extend:
+        """Convenience property for accessing Sanic Extensions.
 
-            packages = []
-            for package_name, module_name in {
-                "sanic-routing": "sanic_routing",
-                "sanic-testing": "sanic_testing",
-                "sanic-ext": "sanic_ext",
-            }.items():
-                try:
-                    module = import_module(module_name)
-                    packages.append(f"{package_name}=={module.__version__}")
-                except ImportError:
-                    ...
+        This property is available if the `sanic-ext` package is installed.
 
-            if packages:
-                display["packages"] = ", ".join(packages)
+        See [Sanic Extensions](/en/plugins/sanic-ext/getting-started)
+            for details.
 
-            if self.config.MOTD_DISPLAY:
-                extra.update(self.config.MOTD_DISPLAY)
+        Returns:
+            Extend: The Sanic Extensions instance.
 
-            logo = (
-                get_logo(coffee=self.state.coffee)
-                if self.config.LOGO == "" or self.config.LOGO is True
-                else self.config.LOGO
+        Examples:
+            A typical use case might be for registering a dependency injection.
+            ```python
+            app.ext.dependency(SomeObject())
+            ```
+        """
+        if not hasattr(self, "_ext"):
+            setup_ext(self, fail=True)
+
+        if not hasattr(self, "_ext"):
+            raise RuntimeError(
+                "Sanic Extensions is not installed. You can add it to your "
+                "environment using:\n$ pip install sanic[ext]\nor\n$ pip "
+                "install sanic-ext"
             )
-            MOTD.output(logo, serve_location, display, extra)
+        return self._ext  # type: ignore
+
+    def extend(
+        self,
+        *,
+        extensions: Optional[list[type[Extension]]] = None,
+        built_in_extensions: bool = True,
+        config: Optional[Union[Config, dict[str, Any]]] = None,
+        **kwargs,
+    ) -> Extend:
+        """Extend Sanic with additional functionality using Sanic Extensions.
+
+        This method enables you to add one or more Sanic Extensions to the
+        current Sanic instance. It allows for more control over the Extend
+        object, such as enabling or disabling built-in extensions or providing
+        custom configuration.
+
+        See [Sanic Extensions](/en/plugins/sanic-ext/getting-started)
+            for details.
+
+        Args:
+            extensions (Optional[List[Type[Extension]]], optional): A list of
+                extensions to add. Defaults to `None`, meaning only built-in
+                extensions are added.
+            built_in_extensions (bool, optional): Whether to enable built-in
+                extensions. Defaults to `True`.
+            config (Optional[Union[Config, Dict[str, Any]]], optional):
+                Optional custom configuration for the extensions. Defaults
+                to `None`.
+            **kwargs: Additional keyword arguments that might be needed by
+                specific extensions.
+
+        Returns:
+            Extend: The Sanic Extensions instance.
+
+        Raises:
+            RuntimeError: If an attempt is made to extend Sanic after Sanic
+                Extensions has already been set up.
+
+        Examples:
+            A typical use case might be to add a custom extension along with
+                built-in ones.
+            ```python
+            app.extend(
+                extensions=[MyCustomExtension],
+                built_in_extensions=True
+            )
+            ```
+        """
+        if hasattr(self, "_ext"):
+            raise RuntimeError(
+                "Cannot extend Sanic after Sanic Extensions has been setup."
+            )
+        setup_ext(
+            self,
+            extensions=extensions,
+            built_in_extensions=built_in_extensions,
+            config=config,
+            fail=True,
+            **kwargs,
+        )
+        return self.ext
 
     # -------------------------------------------------------------------- #
     # Class methods
     # -------------------------------------------------------------------- #
 
     @classmethod
-    def register_app(cls, app: "Sanic") -> None:
-        """
-        Register a Sanic instance
+    def register_app(cls, app: Sanic) -> None:
+        """Register a Sanic instance with the class registry.
+
+        This method adds a Sanic application instance to the class registry,
+        which is used for tracking all instances of the application. It is
+        usually used internally, but can be used to register an application
+        that may have otherwise been created outside of the class registry.
+
+        Args:
+            app (Sanic): The Sanic instance to be registered.
+
+        Raises:
+            SanicException: If the app is not an instance of Sanic or if the
+                name of the app is already in use (unless in test mode).
+
+        Examples:
+            ```python
+            Sanic.register_app(my_app)
+            ```
         """
         if not isinstance(app, cls):
             raise SanicException("Registered app must be an instance of Sanic")
@@ -1599,11 +2134,79 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         cls._app_registry[name] = app
 
     @classmethod
+    def unregister_app(cls, app: Sanic) -> None:
+        """Unregister a Sanic instance from the class registry.
+
+        This method removes a previously registered Sanic application instance
+        from the class registry. This can be useful for cleanup purposes,
+        especially in testing or when an app instance is no longer needed. But,
+        it is typically used internally and should not be needed in most cases.
+
+        Args:
+            app (Sanic): The Sanic instance to be unregistered.
+
+        Raises:
+            SanicException: If the app is not an instance of Sanic.
+
+        Examples:
+            ```python
+            Sanic.unregister_app(my_app)
+            ```
+        """
+        if not isinstance(app, cls):
+            raise SanicException("Registered app must be an instance of Sanic")
+
+        name = app.name
+        if name in cls._app_registry:
+            del cls._app_registry[name]
+
+    @classmethod
     def get_app(
         cls, name: Optional[str] = None, *, force_create: bool = False
-    ) -> "Sanic":
-        """
-        Retrieve an instantiated Sanic instance
+    ) -> Sanic:
+        """Retrieve an instantiated Sanic instance by name.
+
+        This method is best used when needing to get access to an already
+        defined application instance in another part of an app.
+
+        .. warning::
+            Be careful when using this method in the global scope as it is
+            possible that the import path running will cause it to error if
+            the imported global scope runs before the application instance
+            is created.
+
+            It is typically best used in a function or method that is called
+            after the application instance has been created.
+
+            ```python
+            def setup_routes():
+                app = Sanic.get_app()
+                app.add_route(handler_1, '/route1')
+                app.add_route(handler_2, '/route2')
+            ```
+
+        Args:
+            name (Optional[str], optional): Name of the application instance
+                to retrieve. When not specified, it will return the only
+                application instance if there is only one. If not specified
+                and there are multiple application instances, it will raise
+                an exception. Defaults to `None`.
+            force_create (bool, optional): If `True` and the named app does
+                not exist, a new instance will be created. Defaults to `False`.
+
+        Returns:
+            Sanic: The requested Sanic app instance.
+
+        Raises:
+            SanicException: If there are multiple or no Sanic apps found, or
+                if the specified name is not found.
+
+
+        Example:
+            ```python
+            app1 = Sanic("app1")
+            app2 = Sanic.get_app("app1")  # app2 is the same instance as app1
+            ```
         """
         if name is None:
             if len(cls._app_registry) > 1:
@@ -1617,22 +2220,132 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
         try:
             return cls._app_registry[name]
         except KeyError:
+            if name == "__main__":
+                return cls.get_app("__mp_main__", force_create=force_create)
             if force_create:
                 return cls(name)
-            raise SanicException(f'Sanic app name "{name}" not found.')
+            raise SanicException(
+                f"Sanic app name '{name}' not found.\n"
+                "App instantiation must occur outside "
+                "if __name__ == '__main__' "
+                "block or by using an AppLoader.\nSee "
+                "https://sanic.dev/en/guide/deployment/app-loader.html"
+                " for more details."
+            )
+
+    @classmethod
+    def _check_uvloop_conflict(cls) -> None:
+        values = {app.config.USE_UVLOOP for app in cls._app_registry.values()}
+        if len(values) > 1:
+            error_logger.warning(
+                "It looks like you're running several apps with different "
+                "uvloop settings. This is not supported and may lead to "
+                "unintended behaviour."
+            )
 
     # -------------------------------------------------------------------- #
     # Lifecycle
     # -------------------------------------------------------------------- #
 
-    def finalize(self):
+    @contextmanager
+    def amend(self) -> Iterator[None]:
+        """Context manager to allow changes to the app after it has started.
+
+        Typically, once an application has started and is running, you cannot
+        make certain changes, like adding routes, middleware, or signals. This
+        context manager allows you to make those changes, and then finalizes
+        the app again when the context manager exits.
+
+        Yields:
+            None
+
+        Example:
+            ```python
+            with app.amend():
+                app.add_route(handler, '/new_route')
+            ```
+        """
+        if not self.state.is_started:
+            yield
+        else:
+            do_router = self.router.finalized
+            do_signal_router = self.signal_router.finalized
+            if do_router:
+                self.router.reset()
+            if do_signal_router:
+                self.signal_router.reset()
+            yield
+            if do_signal_router:
+                self.signalize(cast(bool, self.config.TOUCHUP))
+            if do_router:
+                self.finalize()
+
+    def finalize(self) -> None:
+        """Finalize the routing configuration for the Sanic application.
+
+        This method completes the routing setup by calling the router's
+        finalize method, and it also finalizes any middleware that has been
+        added to the application. If the application is not in test mode,
+        any finalization errors will be raised.
+
+        Finalization consists of identifying defined routes and optimizing
+        Sanic's performance to meet the application's specific needs. If
+        you are manually adding routes, after Sanic has started, you will
+        typically want to use the  `amend` context manager rather than
+        calling this method directly.
+
+        .. note::
+            This method is usually called internally during the server setup
+            process and does not typically need to be invoked manually.
+
+        Raises:
+            FinalizationError: If there is an error during the finalization
+                process, and the application is not in test mode.
+
+        Example:
+            ```python
+            app.finalize()
+            ```
+        """
         try:
             self.router.finalize()
         except FinalizationError as e:
             if not Sanic.test_mode:
                 raise e
+        self.finalize_middleware()
 
-    def signalize(self):
+    def signalize(self, allow_fail_builtin: bool = True) -> None:
+        """Finalize the signal handling configuration for the Sanic application.
+
+        This method completes the signal handling setup by calling the signal
+        router's finalize method. If the application is not in test mode,
+        any finalization errors will be raised.
+
+        Finalization consists of identifying defined signaliz and optimizing
+        Sanic's performance to meet the application's specific needs. If
+        you are manually adding signals, after Sanic has started, you will
+        typically want to use the  `amend` context manager rather than
+        calling this method directly.
+
+        .. note::
+            This method is usually called internally during the server setup
+            process and does not typically need to be invoked manually.
+
+        Args:
+            allow_fail_builtin (bool, optional): If set to `True`, will allow
+                built-in signals to fail during the finalization process.
+                Defaults to `True`.
+
+        Raises:
+            FinalizationError: If there is an error during the signal
+                finalization process, and the application is not in test mode.
+
+        Example:
+            ```python
+            app.signalize(allow_fail_builtin=False)
+            ```
+        """  # noqa: E501
+        self.signal_router.allow_fail_builtin = allow_fail_builtin
         try:
             self.signal_router.finalize()
         except FinalizationError as e:
@@ -1641,12 +2354,70 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
 
     async def _startup(self):
         self._future_registry.clear()
-        self.signalize()
+
+        if not hasattr(self, "_ext"):
+            setup_ext(self)
+        if hasattr(self, "_ext"):
+            self.ext._display()
+
+        if self.state.is_debug and self.config.TOUCHUP is not True:
+            self.config.TOUCHUP = False
+        elif isinstance(self.config.TOUCHUP, Default):
+            self.config.TOUCHUP = True
+
+        # Setup routers
+        self.signalize(self.config.TOUCHUP)
         self.finalize()
-        ErrorHandler.finalize(
-            self.error_handler, fallback=self.config.FALLBACK_ERROR_FORMAT
-        )
-        TouchUp.run(self)
+
+        route_names = [route.extra.ident for route in self.router.routes]
+        duplicates = {
+            name for name in route_names if route_names.count(name) > 1
+        }
+        if duplicates:
+            names = ", ".join(duplicates)
+            message = (
+                f"Duplicate route names detected: {names}. You should rename "
+                "one or more of them explicitly by using the `name` param, "
+                "or changing the implicit name derived from the class and "
+                "function name. For more details, please see "
+                "https://sanic.dev/en/guide/release-notes/v23.3.html#duplicated-route-names-are-no-longer-allowed"  # noqa
+            )
+            raise ServerError(message)
+
+        Sanic._check_uvloop_conflict()
+
+        # Startup time optimizations
+        if self.state.primary:
+            # TODO:
+            # - Raise warning if secondary apps have error handler config
+            if self.config.TOUCHUP:
+                TouchUp.run(self)
+
+        self.state.is_started = True
+
+    def ack(self) -> None:
+        """Shorthand to send an ack message to the Server Manager.
+
+        In general, this should usually not need to be called manually.
+        It is used to tell the Manager that a process is operational and
+        ready to begin operation.
+        """
+        if hasattr(self, "multiplexer"):
+            self.multiplexer.ack()
+
+    def set_serving(self, serving: bool) -> None:
+        """Set the serving state of the application.
+
+        This method is used to set the serving state of the application.
+        It is used internally by Sanic and should not typically be called
+        manually.
+
+        Args:
+            serving (bool): Whether the application is serving.
+        """
+        self.state.is_running = serving
+        if hasattr(self, "multiplexer"):
+            self.multiplexer.set_serving(serving)
 
     async def _server_event(
         self,
@@ -1660,8 +2431,9 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
             "shutdown",
         ):
             raise SanicException(f"Invalid server event: {event}")
-        if self.state.verbosity >= 1:
-            logger.debug(f"Triggering server events: {event}")
+        logger.debug(
+            f"Triggering server events: {event}", extra={"verbosity": 1}
+        )
         reverse = concern == "shutdown"
         if loop is None:
             loop = self.loop
@@ -1675,3 +2447,100 @@ class Sanic(BaseSanic, metaclass=TouchUpMeta):
                 "loop": loop,
             },
         )
+
+    # -------------------------------------------------------------------- #
+    # Process Management
+    # -------------------------------------------------------------------- #
+
+    def refresh(
+        self,
+        passthru: Optional[dict[str, Any]] = None,
+    ) -> Sanic:
+        """Refresh the application instance. **This is used internally by Sanic**.
+
+        .. warning::
+            This method is intended for internal use only and should not be
+            called directly.
+
+        Args:
+            passthru (Optional[Dict[str, Any]], optional): Optional dictionary
+                of attributes to pass through to the new instance. Defaults to
+                `None`.
+
+        Returns:
+            Sanic: The refreshed application instance.
+        """  # noqa: E501
+        registered = self.__class__.get_app(self.name)
+        if self is not registered:
+            if not registered.state.server_info:
+                registered.state.server_info = self.state.server_info
+            self = registered
+        if passthru:
+            for attr, info in passthru.items():
+                if isinstance(info, dict):
+                    for key, value in info.items():
+                        setattr(getattr(self, attr), key, value)
+                else:
+                    setattr(self, attr, info)
+        if hasattr(self, "multiplexer"):
+            self.shared_ctx.lock()
+        return self
+
+    @property
+    def inspector(self) -> Inspector:
+        """An instance of Inspector for accessing the application's state.
+
+        This can only be accessed from a worker process, and only if the
+        inspector has been enabled.
+
+        See [Inspector](/en/guide/deployment/inspector) for details.
+
+        Returns:
+            Inspector: An instance of Inspector.
+        """
+        if environ.get("SANIC_WORKER_PROCESS") or not self._inspector:
+            raise SanicException(
+                "Can only access the inspector from the main process "
+                "after main_process_start has run. For example, you most "
+                "likely want to use it inside the @app.main_process_ready "
+                "event listener."
+            )
+        return self._inspector
+
+    @property
+    def manager(self) -> WorkerManager:
+        """
+        Property to access the WorkerManager instance.
+
+        This property provides access to the WorkerManager object controlling
+        the worker processes. It can only be accessed from the main process.
+
+        .. note::
+            Make sure to only access this property from the main process,
+            as attempting to do so from a worker process will result
+            in an exception.
+
+        See [WorkerManager](/en/guide/deployment/manager) for details.
+
+        Returns:
+            WorkerManager: The manager responsible for managing
+                worker processes.
+
+        Raises:
+            SanicException: If an attempt is made to access the manager
+                from a worker process or if the manager is not initialized.
+
+        Example:
+            ```python
+            app.manager.manage(...)
+            ```
+        """
+
+        if environ.get("SANIC_WORKER_PROCESS") or not self._manager:
+            raise SanicException(
+                "Can only access the manager from the main process "
+                "after main_process_start has run. For example, you most "
+                "likely want to use it inside the @app.main_process_ready "
+                "event listener."
+            )
+        return self._manager

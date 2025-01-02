@@ -4,7 +4,7 @@ from sanic import Sanic
 from sanic.response import text
 
 
-app = Sanic(__name__)
+app = Sanic("Example")
 
 
 @app.middleware("request")
@@ -23,7 +23,8 @@ def key_exist_handler(request):
     if hasattr(request.ctx, "num"):
         return text("num exist in request")
 
-    return text("num does not exist in reqeust")
+    return text("num does not exist in request")
 
 
-app.run(host="0.0.0.0", port=8000, debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True)

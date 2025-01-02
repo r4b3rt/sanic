@@ -11,36 +11,32 @@ Sanic | Build fast. Run fast.
     :stub-columns: 1
 
     * - Build
-      - | |Py39Test| |Py38Test| |Py37Test|
+      - | |Tests|
     * - Docs
       - | |UserGuide| |Documentation|
     * - Package
-      - | |PyPI| |PyPI version| |Wheel| |Supported implementations| |Code style black|
+      - | |PyPI| |PyPI version| |Wheel| |Supported implementations| |Code style ruff|
     * - Support
       - | |Forums| |Discord| |Awesome|
     * - Stats
-      - | |Downloads| |WkDownloads| |Conda downloads|
+      - | |Monthly Downloads| |Weekly Downloads| |Conda downloads|
 
 .. |UserGuide| image:: https://img.shields.io/badge/user%20guide-sanic-ff0068
-   :target: https://sanicframework.org/
+   :target: https://sanic.dev/
 .. |Forums| image:: https://img.shields.io/badge/forums-community-ff0068.svg
    :target: https://community.sanicframework.org/
-.. |Discord| image:: https://img.shields.io/discord/812221182594121728?logo=discord
+.. |Discord| image:: https://img.shields.io/discord/812221182594121728?logo=discord&label=Discord&color=5865F2
    :target: https://discord.gg/FARQzAEMAA
-.. |Py39Test| image:: https://github.com/sanic-org/sanic/actions/workflows/pr-python39.yml/badge.svg?branch=main
-   :target: https://github.com/sanic-org/sanic/actions/workflows/pr-python39.yml
-.. |Py38Test| image:: https://github.com/sanic-org/sanic/actions/workflows/pr-python38.yml/badge.svg?branch=main
-   :target: https://github.com/sanic-org/sanic/actions/workflows/pr-python38.yml
-.. |Py37Test| image:: https://github.com/sanic-org/sanic/actions/workflows/pr-python37.yml/badge.svg?branch=main
-   :target: https://github.com/sanic-org/sanic/actions/workflows/pr-python37.yml
+.. |Tests| image:: https://github.com/sanic-org/sanic/actions/workflows/tests.yml/badge.svg?branch=main
+   :target: https://github.com/sanic-org/sanic/actions/workflows/tests.yml
 .. |Documentation| image:: https://readthedocs.org/projects/sanic/badge/?version=latest
    :target: http://sanic.readthedocs.io/en/latest/?badge=latest
 .. |PyPI| image:: https://img.shields.io/pypi/v/sanic.svg
    :target: https://pypi.python.org/pypi/sanic/
 .. |PyPI version| image:: https://img.shields.io/pypi/pyversions/sanic.svg
    :target: https://pypi.python.org/pypi/sanic/
-.. |Code style black| image:: https://img.shields.io/badge/code%20style-black-000000.svg
-    :target: https://github.com/ambv/black
+.. |Code style ruff| image:: https://img.shields.io/badge/code%20style-ruff-000000.svg
+    :target: https://docs.astral.sh/ruff/
 .. |Wheel| image:: https://img.shields.io/pypi/wheel/sanic.svg
     :alt: PyPI Wheel
     :target: https://pypi.python.org/pypi/sanic
@@ -50,10 +46,10 @@ Sanic | Build fast. Run fast.
 .. |Awesome| image:: https://cdn.rawgit.com/sindresorhus/awesome/d7305f38d29fed78fa85652e3a63e154dd8e8829/media/badge.svg
     :alt: Awesome Sanic List
     :target: https://github.com/mekicha/awesome-sanic
-.. |Downloads| image:: https://pepy.tech/badge/sanic/month
+.. |Monthly Downloads| image:: https://img.shields.io/pypi/dm/sanic.svg
     :alt: Downloads
     :target: https://pepy.tech/project/sanic
-.. |WkDownloads| image:: https://pepy.tech/badge/sanic/week
+.. |Weekly Downloads| image:: https://img.shields.io/pypi/dw/sanic.svg
     :alt: Downloads
     :target: https://pepy.tech/project/sanic
 .. |Conda downloads| image:: https://img.shields.io/conda/dn/conda-forge/sanic.svg
@@ -62,9 +58,9 @@ Sanic | Build fast. Run fast.
 
 .. end-badges
 
-Sanic is a **Python 3.7+** web server and web framework that's written to go fast. It allows the usage of the ``async/await`` syntax added in Python 3.5, which makes your code non-blocking and speedy.
+Sanic is a **Python 3.9+** web server and web framework that's written to go fast. It allows the usage of the ``async/await`` syntax added in Python 3.5, which makes your code non-blocking and speedy.
 
-Sanic is also ASGI compliant, so you can deploy it with an `alternative ASGI webserver <https://sanic.readthedocs.io/en/latest/sanic/deploying.html#running-via-asgi>`_.
+Sanic is also ASGI compliant, so you can deploy it with an `alternative ASGI webserver <https://sanicframework.org/en/guide/deployment/running.html#asgi>`_.
 
 `Source code on GitHub <https://github.com/sanic-org/sanic/>`_ | `Help and discussion board <https://community.sanicframework.org/>`_ | `User Guide <https://sanicframework.org>`_ | `Chat on Discord <https://discord.gg/FARQzAEMAA>`_
 
@@ -76,6 +72,7 @@ Sponsor
 -------
 
 Check out `open collective <https://opencollective.com/sanic-org>`_ to learn more about helping to fund Sanic.
+
 
 Installation
 ------------
@@ -96,9 +93,6 @@ Installation
   If you are running on a clean install of Fedora 28 or above, please make sure you have the ``redhat-rpm-config`` package installed in case if you want to
   use ``sanic`` with ``ujson`` dependency.
 
-.. note::
-
-  Windows support is currently "experimental" and on a best-effort basis. Multiple workers are also not currently supported on Windows (see `Issue #1517 <https://github.com/sanic-org/sanic/issues/1517>`_), but setting ``workers=1`` should launch the server successfully.
 
 Hello World Example
 -------------------
@@ -108,7 +102,7 @@ Hello World Example
     from sanic import Sanic
     from sanic.response import json
 
-    app = Sanic("My Hello, world app")
+    app = Sanic("my-hello-world-app")
 
     @app.route('/')
     async def test(request):
@@ -138,17 +132,12 @@ And, we can verify it is working: ``curl localhost:8000 -i``
 
 **Now, let's go build something fast!**
 
-Minimum Python version is 3.7. If you need Python 3.6 support, please use v20.12LTS.
+Minimum Python version is 3.8. If you need Python 3.7 support, please use v22.12LTS.
 
 Documentation
 -------------
 
-`User Guide <https://sanicframework.org>`__ and `API Documentation <http://sanic.readthedocs.io/>`__.
-
-Changelog
----------
-
-`Release Changelogs <https://github.com/sanic-org/sanic/blob/master/CHANGELOG.rst>`__.
+User Guide, Changelog, and API Documentation can be found at `sanic.dev <https://sanic.dev>`__.
 
 
 Questions and Discussion

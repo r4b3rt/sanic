@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 
+from typing import TYPE_CHECKING
+
 from sanic.exceptions import SanicException
 
 
-class AsyncioServer:
-    """
-    Wraps an asyncio server with functionality that might be useful to
-    a user who needs to manage the server lifecycle manually.
-    """
+if TYPE_CHECKING:
+    from sanic import Sanic
 
-    __slots__ = ("app", "connections", "loop", "serve_coro", "server", "init")
+
+class AsyncioServer:
+    """Wraps an asyncio server with functionality that might be useful to a user who needs to manage the server lifecycle manually."""  # noqa: E501
+
+    __slots__ = ("app", "connections", "loop", "serve_coro", "server")
 
     def __init__(
         self,
-        app,
+        app: Sanic,
         loop,
         serve_coro,
         connections,
@@ -27,49 +30,40 @@ class AsyncioServer:
         self.loop = loop
         self.serve_coro = serve_coro
         self.server = None
-        self.init = False
 
     def startup(self):
-        """
-        Trigger "before_server_start" events
-        """
-        self.init = True
+        """Trigger "startup" operations on the app"""
         return self.app._startup()
 
     def before_start(self):
-        """
-        Trigger "before_server_start" events
-        """
+        """Trigger "before_server_start" events"""
         return self._server_event("init", "before")
 
     def after_start(self):
-        """
-        Trigger "after_server_start" events
-        """
+        """Trigger "after_server_start" events"""
         return self._server_event("init", "after")
 
     def before_stop(self):
-        """
-        Trigger "before_server_stop" events
-        """
+        """Trigger "before_server_stop" events"""
         return self._server_event("shutdown", "before")
 
     def after_stop(self):
-        """
-        Trigger "after_server_stop" events
-        """
+        """Trigger "after_server_stop" events"""
         return self._server_event("shutdown", "after")
 
     def is_serving(self) -> bool:
+        """Returns True if the server is running, False otherwise"""
         if self.server:
             return self.server.is_serving()
         return False
 
     def wait_closed(self):
+        """Wait until the server is closed"""
         if self.server:
             return self.server.wait_closed()
 
     def close(self):
+        """Close the server"""
         if self.server:
             self.server.close()
             coro = self.wait_closed()
@@ -77,30 +71,35 @@ class AsyncioServer:
             return task
 
     def start_serving(self):
-        if self.server:
-            try:
-                return self.server.start_serving()
-            except AttributeError:
-                raise NotImplementedError(
-                    "server.start_serving not available in this version "
-                    "of asyncio or uvloop."
-                )
+        """Start serving requests"""
+        return self._serve(self.server.start_serving)
 
     def serve_forever(self):
+        """Serve requests until the server is stopped"""
+        return self._serve(self.server.serve_forever)
+
+    def _serve(self, serve_func):
         if self.server:
+            if not self.app.state.is_started:
+                raise SanicException(
+                    "Cannot run Sanic server without first running "
+                    "await server.startup()"
+                )
+
             try:
-                return self.server.serve_forever()
+                return serve_func()
             except AttributeError:
+                name = serve_func.__name__
                 raise NotImplementedError(
-                    "server.serve_forever not available in this version "
+                    f"server.{name} not available in this version "
                     "of asyncio or uvloop."
                 )
 
     def _server_event(self, concern: str, action: str):
-        if not self.init:
+        if not self.app.state.is_started:
             raise SanicException(
                 "Cannot dispatch server event without "
-                "first running server.startup()"
+                "first running await server.startup()"
             )
         return self.app._server_event(concern, action, loop=self.loop)
 

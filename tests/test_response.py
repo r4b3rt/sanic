@@ -1,25 +1,35 @@
 import asyncio
 import inspect
 import os
+import time
 
 from collections import namedtuple
+from datetime import datetime, timedelta
+from email.utils import formatdate, parsedate_to_datetime
+from logging import ERROR, LogRecord
 from mimetypes import guess_type
+from pathlib import Path
 from random import choice
+from typing import Callable, Union
 from urllib.parse import unquote
 
 import pytest
 
 from aiofiles import os as async_os
+from pytest import LogCaptureFixture
 
-from sanic import Sanic
+from sanic import Request, Sanic
+from sanic.compat import Header
+from sanic.constants import DEFAULT_HTTP_CONTENT_TYPE
+from sanic.cookies import CookieJar
 from sanic.response import (
     HTTPResponse,
+    ResponseStream,
     empty,
     file,
     file_stream,
     json,
     raw,
-    stream,
     text,
 )
 
@@ -33,7 +43,7 @@ def test_response_body_not_a_string(app):
     random_num = choice(range(1000))
 
     @app.route("/hello")
-    async def hello_route(request):
+    async def hello_route(request: Request):
         return text(random_num)
 
     request, response = app.test_client.get("/hello")
@@ -41,17 +51,20 @@ def test_response_body_not_a_string(app):
     assert b"Internal Server Error" in response.body
 
 
-async def sample_streaming_fn(response):
-    await response.write("foo,")
+async def sample_streaming_fn(request, response=None):
+    if not response:
+        response = await request.respond(content_type="text/csv")
+    await response.send("foo,")
     await asyncio.sleep(0.001)
-    await response.write("bar")
+    await response.send("bar")
+    await response.eof()
 
 
 def test_method_not_allowed():
     app = Sanic("app")
 
     @app.get("/")
-    async def test_get(request):
+    async def test_get(request: Request):
         return response.json({"hello": "world"})
 
     request, response = app.test_client.head("/")
@@ -67,7 +80,7 @@ def test_method_not_allowed():
     app.router.reset()
 
     @app.post("/")
-    async def test_post(request):
+    async def test_post(request: Request):
         return response.json({"hello": "world"})
 
     request, response = app.test_client.head("/")
@@ -89,27 +102,28 @@ def test_method_not_allowed():
 
 def test_response_header(app):
     @app.get("/")
-    async def test(request):
+    async def test(request: Request):
         return json({"ok": True}, headers={"CONTENT-TYPE": "application/json"})
 
     request, response = app.test_client.get("/")
-    assert dict(response.headers) == {
+    for key, value in {
         "connection": "keep-alive",
         "content-length": "11",
         "content-type": "application/json",
-    }
+    }.items():
+        assert response.headers[key] == value
 
 
 def test_response_content_length(app):
     @app.get("/response_with_space")
-    async def response_with_space(request):
+    async def response_with_space(request: Request):
         return json(
             {"message": "Data", "details": "Some Details"},
             headers={"CONTENT-TYPE": "application/json"},
         )
 
     @app.get("/response_without_space")
-    async def response_without_space(request):
+    async def response_without_space(request: Request):
         return json(
             {"message": "Data", "details": "Some Details"},
             headers={"CONTENT-TYPE": "application/json"},
@@ -135,7 +149,7 @@ def test_response_content_length(app):
 
 def test_response_content_length_with_different_data_types(app):
     @app.get("/")
-    async def get_data_with_different_types(request):
+    async def get_data_with_different_types(request: Request):
         # Indentation issues in the Response is intentional. Please do not fix
         return json(
             {"bool": True, "none": None, "string": "string", "number": -1},
@@ -149,23 +163,27 @@ def test_response_content_length_with_different_data_types(app):
 @pytest.fixture
 def json_app(app):
     @app.route("/")
-    async def test(request):
+    async def test(request: Request):
         return json(JSON_DATA)
 
     @app.get("/no-content")
-    async def no_content_handler(request):
+    async def no_content_handler(request: Request):
         return json(JSON_DATA, status=204)
 
     @app.get("/no-content/unmodified")
-    async def no_content_unmodified_handler(request):
+    async def no_content_unmodified_handler(request: Request):
         return json(None, status=304)
 
     @app.get("/unmodified")
-    async def unmodified_handler(request):
+    async def unmodified_handler(request: Request):
         return json(JSON_DATA, status=304)
 
+    @app.get("/precondition")
+    async def precondition_handler(request: Request):
+        return json(JSON_DATA, status=412)
+
     @app.delete("/")
-    async def delete_handler(request):
+    async def delete_handler(request: Request):
         return json(None, status=204)
 
     return app
@@ -177,6 +195,10 @@ def test_json_response(json_app):
     request, response = json_app.test_client.get("/")
     assert response.status == 200
     assert response.text == json_dumps(JSON_DATA)
+    assert response.json == JSON_DATA
+
+    request, response = json_app.test_client.get("/precondition")
+    assert response.status == 412
     assert response.json == JSON_DATA
 
 
@@ -207,11 +229,8 @@ def test_no_content(json_app):
 @pytest.fixture
 def streaming_app(app):
     @app.route("/")
-    async def test(request):
-        return stream(
-            sample_streaming_fn,
-            content_type="text/csv",
-        )
+    async def test(request: Request):
+        await sample_streaming_fn(request)
 
     return app
 
@@ -219,12 +238,12 @@ def streaming_app(app):
 @pytest.fixture
 def non_chunked_streaming_app(app):
     @app.route("/")
-    async def test(request):
-        return stream(
-            sample_streaming_fn,
+    async def test(request: Request):
+        response = await request.respond(
             headers={"Content-Length": "7"},
             content_type="text/csv",
         )
+        await sample_streaming_fn(request, response)
 
     return app
 
@@ -276,11 +295,18 @@ def test_non_chunked_streaming_returns_correct_content(
 
 def test_stream_response_with_cookies(app):
     @app.route("/")
-    async def test(request):
-        response = stream(sample_streaming_fn, content_type="text/csv")
-        response.cookies["test"] = "modified"
-        response.cookies["test"] = "pass"
-        return response
+    async def test(request: Request):
+        headers = Header()
+        cookies = CookieJar(headers)
+        cookies.add_cookie("test", "modified")
+        cookies.add_cookie("test", "pass")
+        response = await request.respond(
+            content_type="text/csv", headers=headers
+        )
+
+        await response.send("foo,")
+        await asyncio.sleep(0.001)
+        await response.send("bar")
 
     request, response = app.test_client.get("/")
     assert response.cookies["test"] == "pass"
@@ -288,8 +314,8 @@ def test_stream_response_with_cookies(app):
 
 def test_stream_response_without_cookies(app):
     @app.route("/")
-    async def test(request):
-        return stream(sample_streaming_fn, content_type="text/csv")
+    async def test(request: Request):
+        await sample_streaming_fn(request)
 
     request, response = app.test_client.get("/")
     assert response.cookies == {}
@@ -304,17 +330,32 @@ def static_file_directory():
     return static_directory
 
 
-def get_file_content(static_file_directory, file_name):
+def path_str_to_path_obj(static_file_directory: Union[Path, str]):
+    if isinstance(static_file_directory, str):
+        static_file_directory = Path(static_file_directory)
+    return static_file_directory
+
+
+def get_file_content(static_file_directory: Union[Path, str], file_name: str):
     """The content of the static file to check"""
-    with open(os.path.join(static_file_directory, file_name), "rb") as file:
+    static_file_directory = path_str_to_path_obj(static_file_directory)
+    with open(static_file_directory / file_name, "rb") as file:
         return file.read()
+
+
+def get_file_last_modified_timestamp(
+    static_file_directory: Union[Path, str], file_name: str
+):
+    """The content of the static file to check"""
+    static_file_directory = path_str_to_path_obj(static_file_directory)
+    return (static_file_directory / file_name).stat().st_mtime
 
 
 @pytest.mark.parametrize(
     "file_name", ["test.file", "decode me.txt", "python.png"]
 )
 @pytest.mark.parametrize("status", [200, 401])
-def test_file_response(app, file_name, static_file_directory, status):
+def test_file_response(app: Sanic, file_name, static_file_directory, status):
     @app.route("/files/<filename>", methods=["GET"])
     def file_route(request, filename):
         file_path = os.path.join(static_file_directory, filename)
@@ -340,7 +381,7 @@ def test_file_response(app, file_name, static_file_directory, status):
     ],
 )
 def test_file_response_custom_filename(
-    app, source, dest, static_file_directory
+    app: Sanic, source, dest, static_file_directory
 ):
     @app.route("/files/<filename>", methods=["GET"])
     def file_route(request, filename):
@@ -358,7 +399,7 @@ def test_file_response_custom_filename(
 
 
 @pytest.mark.parametrize("file_name", ["test.file", "decode me.txt"])
-def test_file_head_response(app, file_name, static_file_directory):
+def test_file_head_response(app: Sanic, file_name, static_file_directory):
     @app.route("/files/<filename>", methods=["GET", "HEAD"])
     async def file_route(request, filename):
         file_path = os.path.join(static_file_directory, filename)
@@ -391,7 +432,7 @@ def test_file_head_response(app, file_name, static_file_directory):
 @pytest.mark.parametrize(
     "file_name", ["test.file", "decode me.txt", "python.png"]
 )
-def test_file_stream_response(app, file_name, static_file_directory):
+def test_file_stream_response(app: Sanic, file_name, static_file_directory):
     @app.route("/files/<filename>", methods=["GET"])
     def file_route(request, filename):
         file_path = os.path.join(static_file_directory, filename)
@@ -417,7 +458,7 @@ def test_file_stream_response(app, file_name, static_file_directory):
     ],
 )
 def test_file_stream_response_custom_filename(
-    app, source, dest, static_file_directory
+    app: Sanic, source, dest, static_file_directory
 ):
     @app.route("/files/<filename>", methods=["GET"])
     def file_route(request, filename):
@@ -435,7 +476,9 @@ def test_file_stream_response_custom_filename(
 
 
 @pytest.mark.parametrize("file_name", ["test.file", "decode me.txt"])
-def test_file_stream_head_response(app, file_name, static_file_directory):
+def test_file_stream_head_response(
+    app: Sanic, file_name, static_file_directory
+):
     @app.route("/files/<filename>", methods=["GET", "HEAD"])
     async def file_route(request, filename):
         file_path = os.path.join(static_file_directory, filename)
@@ -479,9 +522,8 @@ def test_file_stream_head_response(app, file_name, static_file_directory):
     "size,start,end", [(1024, 0, 1024), (4096, 1024, 8192)]
 )
 def test_file_stream_response_range(
-    app, file_name, static_file_directory, size, start, end
+    app: Sanic, file_name, static_file_directory, size, start, end
 ):
-
     Range = namedtuple("Range", ["size", "start", "end", "total"])
     total = len(get_file_content(static_file_directory, file_name))
     range = Range(size=size, start=start, end=end, total=total)
@@ -508,17 +550,17 @@ def test_file_stream_response_range(
 
 def test_raw_response(app):
     @app.get("/test")
-    def handler(request):
+    def handler(request: Request):
         return raw(b"raw_response")
 
     request, response = app.test_client.get("/test")
-    assert response.content_type == "application/octet-stream"
+    assert response.content_type == DEFAULT_HTTP_CONTENT_TYPE
     assert response.body == b"raw_response"
 
 
 def test_empty_response(app):
     @app.get("/test")
-    def handler(request):
+    def handler(request: Request):
         return empty()
 
     request, response = app.test_client.get("/test")
@@ -526,17 +568,437 @@ def test_empty_response(app):
     assert response.body == b""
 
 
-def test_direct_response_stream(app):
+def test_direct_response_stream(app: Sanic):
     @app.route("/")
-    async def test(request):
+    async def test(request: Request):
         response = await request.respond(content_type="text/csv")
         await response.send("foo,")
         await response.send("bar")
         await response.eof()
-        return response
 
     _, response = app.test_client.get("/")
     assert response.text == "foo,bar"
     assert response.headers["Transfer-Encoding"] == "chunked"
     assert response.headers["Content-Type"] == "text/csv"
     assert "Content-Length" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_direct_response_stream_asgi(app: Sanic):
+    @app.route("/")
+    async def test(request: Request):
+        response = await request.respond(content_type="text/csv")
+        await response.send("foo,")
+        await response.send("bar")
+        await response.eof()
+
+    _, response = await app.asgi_client.get("/")
+    assert response.text == "foo,bar"
+    assert response.headers["Content-Type"] == "text/csv"
+    assert "Content-Length" not in response.headers
+
+
+def test_multiple_responses(
+    app: Sanic,
+    caplog: LogCaptureFixture,
+    message_in_records: Callable[[list[LogRecord], str], bool],
+):
+    @app.route("/1")
+    async def handler1(request: Request):
+        response = await request.respond()
+        await response.send("foo")
+        response = await request.respond()
+
+    @app.route("/2")
+    async def handler2(request: Request):
+        response = await request.respond()
+        response = await request.respond()
+        await response.send("foo")
+
+    @app.get("/3")
+    async def handler3(request: Request):
+        response = await request.respond()
+        await response.send("foo,")
+        response = await request.respond()
+        await response.send("bar")
+
+    @app.get("/4")
+    async def handler4(request: Request):
+        await request.respond(headers={"one": "one"})
+        return json({"foo": "bar"}, headers={"one": "two"})
+
+    @app.get("/5")
+    async def handler5(request: Request):
+        response = await request.respond(headers={"one": "one"})
+        await response.send("foo")
+        return json({"foo": "bar"}, headers={"one": "two"})
+
+    @app.get("/6")
+    async def handler6(request: Request):
+        response = await request.respond(headers={"one": "one"})
+        await response.send("foo, ")
+        json_response = json({"foo": "bar"}, headers={"one": "two"})
+        await response.send("bar")
+        return json_response
+
+    error_msg0 = "Second respond call is not allowed."
+
+    error_msg1 = (
+        "The error response will not be sent to the client for the following "
+        'exception:"Second respond call is not allowed.". A previous '
+        "response has at least partially been sent."
+    )
+
+    error_msg2 = (
+        "The response object returned by the route handler "
+        "will not be sent to client. The request has already "
+        "been responded to."
+    )
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/1")
+        assert response.status == 200
+        assert message_in_records(caplog.records, error_msg0)
+        assert message_in_records(caplog.records, error_msg1)
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/2")
+        assert response.status == 500
+        assert "500 — Internal Server Error" in response.text
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/3")
+        assert response.status == 200
+        assert "foo," in response.text
+        assert message_in_records(caplog.records, error_msg0)
+        assert message_in_records(caplog.records, error_msg1)
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/4")
+        assert response.status == 200
+        assert "foo" not in response.text
+        assert "one" in response.headers
+        assert response.headers["one"] == "one"
+
+        assert message_in_records(caplog.records, error_msg2)
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/5")
+        assert response.status == 200
+        assert "foo" in response.text
+        assert "one" in response.headers
+        assert response.headers["one"] == "one"
+        assert message_in_records(caplog.records, error_msg2)
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/6")
+        assert "foo, bar" in response.text
+        assert "one" in response.headers
+        assert response.headers["one"] == "one"
+        assert message_in_records(caplog.records, error_msg2)
+
+
+def test_send_response_after_eof_should_fail(
+    app: Sanic,
+    caplog: LogCaptureFixture,
+    message_in_records: Callable[[list[LogRecord], str], bool],
+):
+    @app.get("/")
+    async def handler(request: Request):
+        response = await request.respond()
+        await response.send("foo, ")
+        await response.eof()
+        await response.send("bar")
+
+    error_msg1 = (
+        "The error response will not be sent to the client for the following "
+        'exception:"Response stream was ended, no more response '
+        'data is allowed to be sent.". A previous '
+        "response has at least partially been sent."
+    )
+
+    error_msg2 = (
+        "Response stream was ended, no more response "
+        "data is allowed to be sent."
+    )
+
+    with caplog.at_level(ERROR):
+        _, response = app.test_client.get("/")
+        assert "foo, " in response.text
+        assert message_in_records(caplog.records, error_msg1)
+        assert message_in_records(caplog.records, error_msg2)
+
+
+@pytest.mark.asyncio
+async def test_send_response_after_eof_should_fail_asgi(
+    app: Sanic,
+    caplog: LogCaptureFixture,
+    message_in_records: Callable[[list[LogRecord], str], bool],
+):
+    @app.get("/")
+    async def handler(request: Request):
+        response = await request.respond()
+        await response.send("foo, ")
+        await response.eof()
+        await response.send("bar")
+
+    error_msg1 = (
+        "The error response will not be sent to the client for the "
+        'following exception:"There is no request to respond to, '
+        "either the response has already been sent or the request "
+        'has not been received yet.". A previous response has '
+        "at least partially been sent."
+    )
+
+    error_msg2 = (
+        "There is no request to respond to, either the response has "
+        "already been sent or the request has not been received yet."
+    )
+
+    with caplog.at_level(ERROR):
+        _, response = await app.asgi_client.get("/")
+        assert "foo, " in response.text
+        assert message_in_records(caplog.records, error_msg1)
+        assert message_in_records(caplog.records, error_msg2)
+
+
+@pytest.mark.parametrize(
+    "file_name", ["test.file", "decode me.txt", "python.png"]
+)
+def test_file_response_headers(
+    app: Sanic, file_name: str, static_file_directory: str
+):
+    test_last_modified = datetime.now()
+    test_max_age = 10
+    test_expires = test_last_modified.timestamp() + test_max_age
+
+    @app.route("/files/cached/<filename>", methods=["GET"])
+    def file_route_cache(request: Request, filename: str):
+        file_path = (
+            Path(static_file_directory) / unquote(filename)
+        ).absolute()
+        return file(
+            file_path, max_age=test_max_age, last_modified=test_last_modified
+        )
+
+    @app.route(
+        "/files/cached_default_last_modified/<filename>", methods=["GET"]
+    )
+    def file_route_cache_default_last_modified(
+        request: Request, filename: str
+    ):
+        file_path = (
+            Path(static_file_directory) / unquote(filename)
+        ).absolute()
+        return file(file_path, max_age=test_max_age)
+
+    @app.route("/files/no_cache/<filename>", methods=["GET"])
+    def file_route_no_cache(request: Request, filename: str):
+        file_path = (
+            Path(static_file_directory) / unquote(filename)
+        ).absolute()
+        return file(file_path)
+
+    @app.route("/files/no_store/<filename>", methods=["GET"])
+    def file_route_no_store(request: Request, filename: str):
+        file_path = (
+            Path(static_file_directory) / unquote(filename)
+        ).absolute()
+        return file(file_path, no_store=True)
+
+    _, response = app.test_client.get(f"/files/cached/{file_name}")
+    assert response.body == get_file_content(static_file_directory, file_name)
+    headers = response.headers
+    assert (
+        "cache-control" in headers
+        and f"max-age={test_max_age}" in headers.get("cache-control")
+        and "public" in headers.get("cache-control")
+    )
+    assert (
+        "expires" in headers
+        and headers.get("expires")[:-6]
+        == formatdate(test_expires, usegmt=True)[:-6]
+        # [:-6] to allow at most 1 min difference
+        # It's minimal for cases like:
+        # Thu, 26 May 2022 05:36:59 GMT
+        # AND
+        # Thu, 26 May 2022 05:37:00 GMT
+    )
+    assert response.status == 200
+    assert "last-modified" in headers and headers.get(
+        "last-modified"
+    ) == formatdate(test_last_modified.timestamp(), usegmt=True)
+
+    _, response = app.test_client.get(
+        f"/files/cached_default_last_modified/{file_name}"
+    )
+    file_last_modified = get_file_last_modified_timestamp(
+        static_file_directory, file_name
+    )
+    headers = response.headers
+    assert "last-modified" in headers and headers.get(
+        "last-modified"
+    ) == formatdate(file_last_modified, usegmt=True)
+    assert response.status == 200
+
+    _, response = app.test_client.get(f"/files/no_cache/{file_name}")
+    headers = response.headers
+    assert "cache-control" in headers and "no-cache" == headers.get(
+        "cache-control"
+    )
+    assert response.status == 200
+
+    _, response = app.test_client.get(f"/files/no_store/{file_name}")
+    headers = response.headers
+    assert "cache-control" in headers and "no-store" == headers.get(
+        "cache-control"
+    )
+    assert response.status == 200
+
+
+def test_file_validate(app: Sanic, static_file_directory: str):
+    file_name = "test_validate.txt"
+    static_file_directory = Path(static_file_directory)
+    file_path = static_file_directory / file_name
+    file_path = file_path.absolute()
+    test_max_age = 10
+
+    with open(file_path, "w+") as f:
+        f.write("foo\n")
+
+    @app.route("/validate", methods=["GET"])
+    def file_route_cache(request: Request):
+        return file(
+            file_path,
+            request_headers=request.headers,
+            max_age=test_max_age,
+            validate_when_requested=True,
+        )
+
+    _, response = app.test_client.get("/validate")
+    assert response.status == 200
+    assert response.body == b"foo\n"
+    last_modified = response.headers["Last-Modified"]
+
+    time.sleep(1)
+    with open(file_path, "a") as f:
+        f.write("bar\n")
+    _, response = app.test_client.get(
+        "/validate", headers={"If-Modified-Since": last_modified}
+    )
+
+    assert response.status == 200
+    assert response.body == b"foo\nbar\n"
+
+    last_modified = response.headers["Last-Modified"]
+    _, response = app.test_client.get(
+        "/validate", headers={"if-modified-since": last_modified}
+    )
+    assert response.status == 304
+    assert response.body == b""
+
+    file_path.unlink()
+
+
+@pytest.mark.parametrize(
+    "file_name", ["test.file", "decode me.txt", "python.png"]
+)
+def test_file_validating_invalid_header(
+    app: Sanic, file_name: str, static_file_directory: str
+):
+    @app.route("/files/<filename>", methods=["GET"])
+    def file_route(request: Request, filename: str):
+        handler_file_path = (
+            Path(static_file_directory) / unquote(filename)
+        ).absolute()
+
+        return file(
+            handler_file_path,
+            request_headers=request.headers,
+            validate_when_requested=True,
+        )
+
+    _, response = app.test_client.get(f"/files/{file_name}")
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+
+    _, response = app.test_client.get(
+        f"/files/{file_name}", headers={"if-modified-since": "invalid-value"}
+    )
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+
+    _, response = app.test_client.get(
+        f"/files/{file_name}", headers={"if-modified-since": ""}
+    )
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+
+
+@pytest.mark.parametrize(
+    "file_name", ["test.file", "decode me.txt", "python.png"]
+)
+def test_file_validating_304_response_file_route(
+    app: Sanic, file_name: str, static_file_directory: str
+):
+    @app.route("/files/<filename>", methods=["GET"])
+    def file_route(request: Request, filename: str):
+        handler_file_path = (
+            Path(static_file_directory) / unquote(filename)
+        ).absolute()
+
+        return file(
+            handler_file_path,
+            request_headers=request.headers,
+            validate_when_requested=True,
+        )
+
+    _, response = app.test_client.get(f"/files/{file_name}")
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+
+    _, response = app.test_client.get(
+        f"/files/{file_name}",
+        headers={"if-modified-since": response.headers["Last-Modified"]},
+    )
+    assert response.status == 304
+    assert response.body == b""
+
+
+@pytest.mark.parametrize(
+    "file_name", ["test.file", "decode me.txt", "python.png"]
+)
+def test_file_validating_304_response(
+    app: Sanic, file_name: str, static_file_directory: str
+):
+    app.static("static", Path(static_file_directory) / file_name)
+
+    _, response = app.test_client.get("/static")
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+    last_modified = parsedate_to_datetime(response.headers["Last-Modified"])
+    last_modified += timedelta(seconds=1)
+    _, response = app.test_client.get(
+        "/static",
+        headers={
+            "if-modified-since": formatdate(
+                last_modified.timestamp(), usegmt=True
+            )
+        },
+    )
+    assert response.status == 304
+    assert response.body == b""
+
+
+def test_stream_response_with_default_headers(app: Sanic):
+    async def sample_streaming_fn(response_):
+        await response_.write("foo")
+
+    @app.route("/")
+    async def test(request: Request):
+        return ResponseStream(sample_streaming_fn, content_type="text/csv")
+
+    _, response = app.test_client.get("/")
+    assert response.text == "foo"
+    assert response.headers["Transfer-Encoding"] == "chunked"
+    assert response.headers["Content-Type"] == "text/csv"

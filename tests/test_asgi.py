@@ -1,16 +1,31 @@
 import asyncio
+import logging
 
 from collections import deque, namedtuple
+from unittest.mock import call
 
 import pytest
 import uvicorn
 
+from httpx import Headers
+from pytest import MonkeyPatch
+
 from sanic import Sanic
-from sanic.asgi import MockTransport
-from sanic.exceptions import Forbidden, InvalidUsage, ServiceUnavailable
+from sanic.application.state import Mode
+from sanic.asgi import Lifespan, MockTransport
+from sanic.exceptions import BadRequest, Forbidden, ServiceUnavailable
 from sanic.request import Request
 from sanic.response import json, text
 from sanic.server.websockets.connection import WebSocketConnection
+from sanic.signals import RESERVED_NAMESPACES
+
+from .conftest import get_port
+
+
+try:
+    from unittest.mock import AsyncMock
+except ImportError:
+    from tests.asyncmock import AsyncMock  # type: ignore
 
 
 @pytest.fixture
@@ -41,10 +56,13 @@ def transport(message_stack, receive, send):
 
 @pytest.fixture
 def protocol(transport):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    transport.loop = loop
     return transport.get_protocol()
 
 
-def test_listeners_triggered():
+def test_listeners_triggered(caplog):
     app = Sanic("app")
     before_server_start = False
     after_server_start = False
@@ -79,23 +97,73 @@ def test_listeners_triggered():
         def install_signal_handlers(self):
             pass
 
-    config = uvicorn.Config(app=app, loop="asyncio", limit_max_requests=0)
+    config = uvicorn.Config(
+        app=app, loop="asyncio", limit_max_requests=0, port=get_port()
+    )
     server = CustomServer(config=config)
 
-    with pytest.warns(UserWarning):
+    start_message = (
+        'You have set a listener for "before_server_start" in ASGI mode. '
+        "It will be executed as early as possible, but not before the ASGI "
+        "server is started."
+    )
+    stop_message = (
+        'You have set a listener for "after_server_stop" in ASGI mode. '
+        "It will be executed as late as possible, but not after the ASGI "
+        "server is stopped."
+    )
+
+    with caplog.at_level(logging.DEBUG):
         server.run()
 
-    all_tasks = asyncio.all_tasks(asyncio.get_event_loop())
-    for task in all_tasks:
-        task.cancel()
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
 
     assert before_server_start
     assert after_server_start
     assert before_server_stop
     assert after_server_stop
 
+    app.state.mode = Mode.DEBUG
+    with caplog.at_level(logging.DEBUG):
+        server.run()
 
-def test_listeners_triggered_async(app):
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
+
+    app.state.verbosity = 2
+    with caplog.at_level(logging.DEBUG):
+        server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) in caplog.record_tuples
+
+
+def test_listeners_triggered_async(app, caplog):
     before_server_start = False
     after_server_start = False
     before_server_stop = False
@@ -129,20 +197,100 @@ def test_listeners_triggered_async(app):
         def install_signal_handlers(self):
             pass
 
-    config = uvicorn.Config(app=app, loop="asyncio", limit_max_requests=0)
+    config = uvicorn.Config(
+        app=app, loop="asyncio", limit_max_requests=0, port=get_port()
+    )
     server = CustomServer(config=config)
 
-    with pytest.warns(UserWarning):
+    start_message = (
+        'You have set a listener for "before_server_start" in ASGI mode. '
+        "It will be executed as early as possible, but not before the ASGI "
+        "server is started."
+    )
+    stop_message = (
+        'You have set a listener for "after_server_stop" in ASGI mode. '
+        "It will be executed as late as possible, but not after the ASGI "
+        "server is stopped."
+    )
+
+    with caplog.at_level(logging.DEBUG):
         server.run()
 
-    all_tasks = asyncio.all_tasks(asyncio.get_event_loop())
-    for task in all_tasks:
-        task.cancel()
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
 
     assert before_server_start
     assert after_server_start
     assert before_server_stop
     assert after_server_stop
+
+    app.state.mode = Mode.DEBUG
+    app.state.verbosity = 0
+    with caplog.at_level(logging.DEBUG):
+        server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) not in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) not in caplog.record_tuples
+
+    app.state.verbosity = 2
+    with caplog.at_level(logging.DEBUG):
+        server.run()
+
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        start_message,
+    ) in caplog.record_tuples
+    assert (
+        "sanic.root",
+        logging.DEBUG,
+        stop_message,
+    ) in caplog.record_tuples
+
+
+def test_non_default_uvloop_config_raises_warning(app):
+    app.config.USE_UVLOOP = True
+
+    class CustomServer(uvicorn.Server):
+        def install_signal_handlers(self):
+            pass
+
+    config = uvicorn.Config(
+        app=app, loop="asyncio", limit_max_requests=0, port=get_port()
+    )
+    server = CustomServer(config=config)
+
+    with pytest.warns(UserWarning) as records:
+        server.run()
+
+    msg = ""
+    for record in records:
+        _msg = str(record.message)
+        if _msg.startswith("You have set the USE_UVLOOP configuration"):
+            msg = _msg
+            break
+
+    assert msg == (
+        "You have set the USE_UVLOOP configuration option, but Sanic "
+        "cannot control the event loop when running in ASGI mode."
+        "This option will be ignored."
+    )
 
 
 @pytest.mark.asyncio
@@ -197,7 +345,7 @@ async def test_websocket_send(send, receive, message_stack):
 
 
 @pytest.mark.asyncio
-async def test_websocket_receive(send, receive, message_stack):
+async def test_websocket_text_receive(send, receive, message_stack):
     msg = {"text": "hello", "type": "websocket.receive"}
     message_stack.append(msg)
 
@@ -205,6 +353,17 @@ async def test_websocket_receive(send, receive, message_stack):
     text = await ws.receive()
 
     assert text == msg["text"]
+
+
+@pytest.mark.asyncio
+async def test_websocket_bytes_receive(send, receive, message_stack):
+    msg = {"bytes": b"hello", "type": "websocket.receive"}
+    message_stack.append(msg)
+
+    ws = WebSocketConnection(send, receive)
+    data = await ws.receive()
+
+    assert data == msg["bytes"]
 
 
 @pytest.mark.asyncio
@@ -255,7 +414,7 @@ async def test_websocket_accept_with_multiple_subprotocols(
 
 
 def test_improper_websocket_connection(transport, send, receive):
-    with pytest.raises(InvalidUsage):
+    with pytest.raises(BadRequest):
         transport.get_websocket_connection()
 
     transport.create_websocket_connection(send, receive)
@@ -278,7 +437,7 @@ async def test_request_class_custom():
     class MyCustomRequest(Request):
         pass
 
-    app = Sanic(name=__name__, request_class=MyCustomRequest)
+    app = Sanic(name="Test", request_class=MyCustomRequest)
 
     @app.get("/custom")
     def custom_request(request):
@@ -293,11 +452,8 @@ async def test_cookie_customization(app):
     @app.get("/cookie")
     def get_cookie(request):
         response = text("There's a cookie up in this response")
-        response.cookies["test"] = "Cookie1"
-        response.cookies["test"]["httponly"] = True
-
-        response.cookies["c2"] = "Cookie2"
-        response.cookies["c2"]["httponly"] = False
+        response.add_cookie("test", "Cookie1", httponly=True)
+        response.add_cookie("c2", "Cookie2", httponly=False)
 
         return response
 
@@ -376,3 +532,145 @@ async def test_request_exception_suppressed_by_middleware(app):
 
     _, response = await app.asgi_client.get("/error-prone")
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_signals_triggered(app):
+    @app.get("/test_signals_triggered")
+    async def _request(request):
+        return text("test_signals_triggered")
+
+    signals_triggered = []
+    signals_expected = [
+        # "http.lifecycle.begin",
+        # "http.lifecycle.read_head",
+        "http.lifecycle.request",
+        "http.lifecycle.handle",
+        "http.routing.before",
+        "http.routing.after",
+        "http.handler.before",
+        "http.handler.after",
+        "http.lifecycle.response",
+        # "http.lifecycle.send",
+        # "http.lifecycle.complete",
+    ]
+
+    def signal_handler(signal):
+        return lambda *a, **kw: signals_triggered.append(signal)
+
+    for signal in RESERVED_NAMESPACES["http"]:
+        app.signal(signal)(signal_handler(signal))
+
+    _, response = await app.asgi_client.get("/test_signals_triggered")
+    assert response.status_code == 200
+    assert response.text == "test_signals_triggered"
+    assert signals_triggered == signals_expected
+
+
+@pytest.mark.asyncio
+async def test_asgi_serve_location(app):
+    @app.get("/")
+    def _request(request: Request):
+        return text(request.app.serve_location)
+
+    _, response = await app.asgi_client.get("/")
+    assert response.text == "http://<ASGI>"
+
+
+@pytest.mark.asyncio
+async def test_error_on_lifespan_exception_start(app, caplog):
+    @app.before_server_start
+    async def before_server_start(_):
+        1 / 0
+
+    recv = AsyncMock(
+        side_effect=[
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ]
+    )
+    send = AsyncMock()
+    app.asgi = True
+
+    lifespan = Lifespan(app, {"type": "lifespan"}, recv, send)
+    with caplog.at_level(logging.ERROR):
+        await lifespan()
+
+    send.assert_has_calls(
+        [
+            call(
+                {
+                    "type": "lifespan.startup.failed",
+                    "message": "division by zero",
+                }
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_error_on_lifespan_exception_stop(app: Sanic):
+    @app.before_server_stop
+    async def before_server_stop(_):
+        1 / 0
+
+    recv = AsyncMock(
+        side_effect=[
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ]
+    )
+    send = AsyncMock()
+    app.asgi = True
+    await app._startup()
+
+    lifespan = Lifespan(app, {"type": "lifespan"}, recv, send)
+    await lifespan()
+
+    send.assert_has_calls(
+        [
+            call(
+                {
+                    "type": "lifespan.shutdown.failed",
+                    "message": "division by zero",
+                }
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_asgi_headers_decoding(app: Sanic, monkeypatch: MonkeyPatch):
+    @app.get("/")
+    def handler(request: Request):
+        return text("")
+
+    headers_init = Headers.__init__
+
+    def mocked_headers_init(self, *args, **kwargs):
+        if "encoding" in kwargs:
+            kwargs.pop("encoding")
+        headers_init(self, encoding="utf-8", *args, **kwargs)
+
+    monkeypatch.setattr(Headers, "__init__", mocked_headers_init)
+
+    message = "Header names can only contain US-ASCII characters"
+    with pytest.raises(BadRequest, match=message):
+        _, response = await app.asgi_client.get("/", headers={"😂": "😅"})
+
+    _, response = await app.asgi_client.get("/", headers={"Test-Header": "😅"})
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_asgi_url_decoding(app):
+    @app.get("/dir/<name>", unquote=True)
+    def _request(request: Request, name):
+        return text(name)
+
+    # 2F should not become a path separator (unquoted later)
+    _, response = await app.asgi_client.get("/dir/some%2Fpath")
+    assert response.text == "some/path"
+
+    _, response = await app.asgi_client.get("/dir/some%F0%9F%98%80path")
+    assert response.text == "some😀path"

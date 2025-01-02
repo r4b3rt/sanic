@@ -8,9 +8,9 @@ are added. And blueprint response middleware are executed in _reverse_ order.
 On a valid request, it should print "1 2 3 6 5 4" to terminal
 """
 
-app = Sanic(__name__)
+app = Sanic("Example")
 
-bp = Blueprint("bp_" + __name__)
+bp = Blueprint("bp_example")
 
 
 @bp.on_request
@@ -50,4 +50,5 @@ def pop_handler(request):
 
 app.blueprint(bp, url_prefix="/bp")
 
-app.run(host="0.0.0.0", port=8000, debug=True, auto_reload=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True, auto_reload=False)

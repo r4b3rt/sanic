@@ -3,38 +3,32 @@ on:
   push:
     branches:
       - main
+      - current-release
+      - "*LTS"
     tags:
       - "!*" # Do not execute on tags
-    paths:
-      - sanic/*
-      - tests/*
   pull_request:
-    paths:
-      - "!*.MD"
-    types: [review_requested, ready_for_review]
+    branches:
+      - main
+      - current-release
+      - "*LTS"
+
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
+  coverage:
+    name: Check coverage
+    runs-on: ubuntu-latest
     strategy:
-      matrix:
-        python-version: [3.9]
-        os: [ubuntu-latest]
       fail-fast: false
 
     steps:
-      - uses: actions/checkout@v2
-
-      - uses: actions/setup-python@v1
+      - name: Run coverage
+        uses: sanic-org/simple-tox-action@v1
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies 🔨
-        run: |
-          python -m pip install --upgrade pip
-          pip install tox
-      - uses: paambaati/codeclimate-action@v2.5.3
-        if: always()
-        env:
-          CC_TEST_REPORTER_ID: ${{ secrets.CODECLIMATE }}
+          python-version: "3.11"
+          tox-env: coverage
+          ignore-errors: true
+      - name: Run Codecov
+        uses: codecov/codecov-action@v3
         with:
-          coverageCommand: tox -e coverage
+          files: ./coverage.xml
+          fail_ci_if_error: false

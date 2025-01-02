@@ -1,10 +1,9 @@
-from httpx import AsyncByteStream
 from sanic_testing.reusable import ReusableClient
 
 from sanic.response import json, text
 
 
-def test_no_body_requests(app):
+def test_no_body_requests(app, port):
     @app.get("/")
     async def handler(request):
         return json(
@@ -14,7 +13,7 @@ def test_no_body_requests(app):
             }
         )
 
-    client = ReusableClient(app, port=1234)
+    client = ReusableClient(app, port=port)
 
     with client:
         _, response1 = client.get("/")
@@ -25,7 +24,7 @@ def test_no_body_requests(app):
     assert response1.json["connection_id"] == response2.json["connection_id"]
 
 
-def test_json_body_requests(app):
+def test_json_body_requests(app, port):
     @app.post("/")
     async def handler(request):
         return json(
@@ -36,7 +35,7 @@ def test_json_body_requests(app):
             }
         )
 
-    client = ReusableClient(app, port=1234)
+    client = ReusableClient(app, port=port)
 
     with client:
         _, response1 = client.post("/", json={"foo": True})
@@ -48,7 +47,7 @@ def test_json_body_requests(app):
     assert response1.json["connection_id"] == response2.json["connection_id"]
 
 
-def test_streaming_body_requests(app):
+def test_streaming_body_requests(app, port):
     @app.post("/", stream=True)
     async def handler(request):
         data = [part.decode("utf-8") async for part in request.stream]
@@ -62,19 +61,15 @@ def test_streaming_body_requests(app):
 
     data = ["hello", "world"]
 
-    class Data(AsyncByteStream):
-        def __init__(self, data):
-            self.data = data
+    client = ReusableClient(app, port=port)
 
-        async def __aiter__(self):
-            for value in self.data:
-                yield value.encode("utf-8")
-
-    client = ReusableClient(app, port=1234)
+    async def stream(data):
+        for value in data:
+            yield value.encode("utf-8")
 
     with client:
-        _, response1 = client.post("/", data=Data(data))
-        _, response2 = client.post("/", data=Data(data))
+        _, response1 = client.post("/", data=stream(data))
+        _, response2 = client.post("/", data=stream(data))
 
     assert response1.status == response2.status == 200
     assert response1.json["data"] == response2.json["data"] == data
@@ -82,7 +77,7 @@ def test_streaming_body_requests(app):
     assert response1.json["connection_id"] == response2.json["connection_id"]
 
 
-def test_bad_headers(app):
+def test_bad_headers(app, port):
     @app.get("/")
     async def handler(request):
         return text("")
@@ -91,7 +86,7 @@ def test_bad_headers(app):
     async def reqid(request, response):
         response.headers["x-request-id"] = request.id
 
-    client = ReusableClient(app, port=1234)
+    client = ReusableClient(app, port=port)
     bad_headers = {"bad": "bad" * 5_000}
 
     with client:

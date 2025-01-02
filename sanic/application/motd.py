@@ -1,21 +1,22 @@
-import sys
-
 from abc import ABC, abstractmethod
 from shutil import get_terminal_size
 from textwrap import indent, wrap
-from typing import Dict, Optional
+from typing import Optional
 
 from sanic import __version__
+from sanic.helpers import is_atty
 from sanic.log import logger
 
 
 class MOTD(ABC):
+    """Base class for the Message of the Day (MOTD) display."""
+
     def __init__(
         self,
         logo: Optional[str],
         serve_location: str,
-        data: Dict[str, str],
-        extra: Dict[str, str],
+        data: dict[str, str],
+        extra: dict[str, str],
     ) -> None:
         self.logo = logo
         self.serve_location = serve_location
@@ -26,23 +27,33 @@ class MOTD(ABC):
 
     @abstractmethod
     def display(self):
-        ...  # noqa
+        """Display the MOTD."""
 
     @classmethod
     def output(
         cls,
         logo: Optional[str],
         serve_location: str,
-        data: Dict[str, str],
-        extra: Dict[str, str],
+        data: dict[str, str],
+        extra: dict[str, str],
     ) -> None:
-        motd_class = MOTDTTY if sys.stdout.isatty() else MOTDBasic
+        """Output the MOTD.
+
+        Args:
+            logo (Optional[str]): Logo to display.
+            serve_location (str): Location to serve.
+            data (Dict[str, str]): Data to display.
+            extra (Dict[str, str]): Extra data to display.
+        """
+        motd_class = MOTDTTY if is_atty() else MOTDBasic
         motd_class(logo, serve_location, data, extra).display()
 
 
 class MOTDBasic(MOTD):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    """A basic MOTD display.
+
+    This is used when the terminal does not support ANSI escape codes.
+    """
 
     def display(self):
         if self.logo:
@@ -59,11 +70,14 @@ class MOTDBasic(MOTD):
 
 
 class MOTDTTY(MOTD):
+    """A MOTD display for terminals that support ANSI escape codes."""
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.set_variables()
 
     def set_variables(self):  # no  cov
+        """Set the variables used for display."""
         fallback = (108, 24)
         terminal_width = max(
             get_terminal_size(fallback=fallback).columns, fallback[0]
@@ -77,6 +91,14 @@ class MOTDTTY(MOTD):
             self.value_width = min(
                 max(map(len, self.data.values())), self.max_value_width
             )
+        if self.extra:
+            self.key_width = max(
+                self.key_width, max(map(len, self.extra.keys()))
+            )
+            self.value_width = min(
+                max((*map(len, self.extra.values()), self.value_width)),
+                self.max_value_width,
+            )
         self.logo_lines = self.logo.split("\n") if self.logo else []
         self.logo_line_length = 24
         self.centering_length = (
@@ -84,20 +106,32 @@ class MOTDTTY(MOTD):
         )
         self.display_length = self.key_width + self.value_width + 2
 
-    def display(self):
-        version = f"Sanic v{__version__}".center(self.centering_length)
+    def display(self, version=True, action="Goin' Fast", out=None):
+        """Display the MOTD.
+
+        Args:
+            version (bool, optional): Display the version. Defaults to `True`.
+            action (str, optional): Action to display. Defaults to
+                `"Goin' Fast"`.
+            out (Optional[Callable], optional): Output function. Defaults to
+                `None`.
+        """
+        if not out:
+            out = logger.info
+        header = "Sanic"
+        if version:
+            header += f" v{__version__}"
+        header = header.center(self.centering_length)
         running = (
-            f"Goin' Fast @ {self.serve_location}"
-            if self.serve_location
-            else ""
+            f"{action} @ {self.serve_location}" if self.serve_location else ""
         ).center(self.centering_length)
-        length = len(version) + 2 - self.logo_line_length
+        length = len(header) + 2 - self.logo_line_length
         first_filler = "─" * (self.logo_line_length - 1)
         second_filler = "─" * length
         display_filler = "─" * (self.display_length + 2)
         lines = [
             f"\n┌{first_filler}─{second_filler}┐",
-            f"│ {version} │",
+            f"│ {header} │",
             f"│ {running} │",
             f"├{first_filler}┬{second_filler}┤",
         ]
@@ -105,13 +139,13 @@ class MOTDTTY(MOTD):
         self._render_data(lines, self.data, 0)
         if self.extra:
             logo_part = self._get_logo_part(len(lines) - 4)
-            lines.append(f"| {logo_part} ├{display_filler}┤")
+            lines.append(f"│ {logo_part} ├{display_filler}┤")
             self._render_data(lines, self.extra, len(lines) - 4)
 
         self._render_fill(lines)
 
         lines.append(f"└{first_filler}┴{second_filler}┘\n")
-        logger.info(indent("\n".join(lines), "  "))
+        out(indent("\n".join(lines), "  "))
 
     def _render_data(self, lines, data, start):
         offset = 0

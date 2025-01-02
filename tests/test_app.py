@@ -2,18 +2,25 @@ import asyncio
 import logging
 import re
 
-from email import message
+from collections import Counter
 from inspect import isawaitable
 from os import environ
 from unittest.mock import Mock, patch
 
-import py
 import pytest
 
+import sanic
+
 from sanic import Sanic
+from sanic.compat import OS_IS_WINDOWS
 from sanic.config import Config
 from sanic.exceptions import SanicException
+from sanic.helpers import Default
+from sanic.log import LOGGING_CONFIG_DEFAULTS
 from sanic.response import text
+from sanic.router import Route
+
+from .conftest import get_port
 
 
 @pytest.fixture(autouse=True)
@@ -21,16 +28,7 @@ def clear_app_registry():
     Sanic._app_registry = {}
 
 
-def uvloop_installed():
-    try:
-        import uvloop  # noqa
-
-        return True
-    except ImportError:
-        return False
-
-
-def test_app_loop_running(app):
+def test_app_loop_running(app: Sanic):
     @app.get("/test")
     async def handler(request):
         assert isinstance(app.loop, asyncio.AbstractEventLoop)
@@ -40,49 +38,53 @@ def test_app_loop_running(app):
     assert response.text == "pass"
 
 
-def test_create_asyncio_server(app):
-    if not uvloop_installed():
-        loop = asyncio.get_event_loop()
-        asyncio_srv_coro = app.create_server(return_asyncio_server=True)
-        assert isawaitable(asyncio_srv_coro)
-        srv = loop.run_until_complete(asyncio_srv_coro)
-        assert srv.is_serving() is True
+@pytest.mark.asyncio
+def test_create_asyncio_server(app: Sanic, port: int):
+    loop = asyncio.get_event_loop()
+    asyncio_srv_coro = app.create_server(return_asyncio_server=True, port=port)
+    assert isawaitable(asyncio_srv_coro)
+    srv = loop.run_until_complete(asyncio_srv_coro)
+    assert srv.is_serving() is True
 
 
-def test_asyncio_server_no_start_serving(app):
-    if not uvloop_installed():
-        loop = asyncio.get_event_loop()
-        asyncio_srv_coro = app.create_server(
-            port=43123,
-            return_asyncio_server=True,
-            asyncio_server_kwargs=dict(start_serving=False),
-        )
-        srv = loop.run_until_complete(asyncio_srv_coro)
-        assert srv.is_serving() is False
+@pytest.mark.asyncio
+def test_asyncio_server_no_start_serving(app: Sanic, port):
+    loop = asyncio.get_event_loop()
+    asyncio_srv_coro = app.create_server(
+        port=port,
+        return_asyncio_server=True,
+        asyncio_server_kwargs=dict(start_serving=False),
+    )
+    srv = loop.run_until_complete(asyncio_srv_coro)
+    assert srv.is_serving() is False
 
 
-def test_asyncio_server_start_serving(app):
-    if not uvloop_installed():
-        loop = asyncio.get_event_loop()
-        asyncio_srv_coro = app.create_server(
-            port=43124,
-            return_asyncio_server=True,
-            asyncio_server_kwargs=dict(start_serving=False),
-        )
-        srv = loop.run_until_complete(asyncio_srv_coro)
-        assert srv.is_serving() is False
-        loop.run_until_complete(srv.start_serving())
-        assert srv.is_serving() is True
-        wait_close = srv.close()
-        loop.run_until_complete(wait_close)
-        # Looks like we can't easily test `serve_forever()`
+@pytest.mark.asyncio
+def test_asyncio_server_start_serving(app: Sanic):
+    loop = asyncio.get_event_loop()
+    asyncio_srv_coro = app.create_server(
+        port=43124,
+        return_asyncio_server=True,
+        asyncio_server_kwargs=dict(start_serving=False),
+    )
+    srv = loop.run_until_complete(asyncio_srv_coro)
+    assert srv.is_serving() is False
+    loop.run_until_complete(srv.startup())
+    loop.run_until_complete(srv.start_serving())
+    assert srv.is_serving() is True
+    wait_close = srv.close()
+    loop.run_until_complete(wait_close)
+    # Looks like we can't easily test `serve_forever()`
 
 
-def test_create_server_main(app, caplog):
+@pytest.mark.asyncio
+def test_create_server_main(app: Sanic, caplog, port):
     app.listener("main_process_start")(lambda *_: ...)
     loop = asyncio.get_event_loop()
     with caplog.at_level(logging.INFO):
-        asyncio_srv_coro = app.create_server(return_asyncio_server=True)
+        asyncio_srv_coro = app.create_server(
+            return_asyncio_server=True, port=port
+        )
         loop.run_until_complete(asyncio_srv_coro)
     assert (
         "sanic.root",
@@ -92,11 +94,30 @@ def test_create_server_main(app, caplog):
     ) in caplog.record_tuples
 
 
-def test_create_server_main_convenience(app, caplog):
+@pytest.mark.asyncio
+def test_create_server_no_startup(app: Sanic, port):
+    loop = asyncio.get_event_loop()
+    asyncio_srv_coro = app.create_server(
+        port=port,
+        return_asyncio_server=True,
+        asyncio_server_kwargs=dict(start_serving=False),
+    )
+    srv = loop.run_until_complete(asyncio_srv_coro)
+    message = (
+        "Cannot run Sanic server without first running await server.startup()"
+    )
+    with pytest.raises(SanicException, match=message):
+        loop.run_until_complete(srv.start_serving())
+
+
+@pytest.mark.asyncio
+def test_create_server_main_convenience(app: Sanic, caplog, port):
     app.main_process_start(lambda *_: ...)
     loop = asyncio.get_event_loop()
     with caplog.at_level(logging.INFO):
-        asyncio_srv_coro = app.create_server(return_asyncio_server=True)
+        asyncio_srv_coro = app.create_server(
+            return_asyncio_server=True, port=port
+        )
         loop.run_until_complete(asyncio_srv_coro)
     assert (
         "sanic.root",
@@ -106,7 +127,7 @@ def test_create_server_main_convenience(app, caplog):
     ) in caplog.record_tuples
 
 
-def test_app_loop_not_running(app):
+def test_app_loop_not_running(app: Sanic):
     with pytest.raises(SanicException) as excinfo:
         app.loop
 
@@ -116,10 +137,9 @@ def test_app_loop_not_running(app):
     )
 
 
-def test_app_run_raise_type_error(app):
-
+def test_app_run_raise_type_error(app: Sanic, port):
     with pytest.raises(TypeError) as excinfo:
-        app.run(loop="loop")
+        app.run(loop="loop", port=port)
 
     assert str(excinfo.value) == (
         "loop is not a valid argument. To use an existing loop, "
@@ -129,8 +149,7 @@ def test_app_run_raise_type_error(app):
     )
 
 
-def test_app_route_raise_value_error(app):
-
+def test_app_route_raise_value_error(app: Sanic):
     with pytest.raises(ValueError) as excinfo:
 
         @app.route("/test")
@@ -143,11 +162,15 @@ def test_app_route_raise_value_error(app):
     )
 
 
-def test_app_handle_request_handler_is_none(app, monkeypatch):
-    def mockreturn(*args, **kwargs):
-        return Mock(), None, {}
+def test_app_handle_request_handler_is_none(app: Sanic, monkeypatch):
+    app.config.TOUCHUP = False
+    route = Mock(spec=Route)
+    route.extra.request_middleware = []
+    route.extra.response_middleware = []
 
-    # Not sure how to make app.router.get() return None, so use mock here.
+    def mockreturn(*args, **kwargs):
+        return route, None, {}
+
     monkeypatch.setattr(app.router, "get", mockreturn)
 
     @app.get("/test")
@@ -164,7 +187,7 @@ def test_app_handle_request_handler_is_none(app, monkeypatch):
 
 @pytest.mark.parametrize("websocket_enabled", [True, False])
 @pytest.mark.parametrize("enable", [True, False])
-def test_app_enable_websocket(app, websocket_enabled, enable):
+def test_app_enable_websocket(app: Sanic, websocket_enabled, enable):
     app.websocket_enabled = websocket_enabled
     app.enable_websocket(enable=enable)
 
@@ -174,11 +197,11 @@ def test_app_enable_websocket(app, websocket_enabled, enable):
     async def handler(request, ws):
         await ws.send("test")
 
-    assert app.websocket_enabled == True
+    assert app.websocket_enabled is True
 
 
-@patch("sanic.app.WebSocketProtocol")
-def test_app_websocket_parameters(websocket_protocol_mock, app):
+@patch("sanic.mixins.startup.WebSocketProtocol")
+def test_app_websocket_parameters(websocket_protocol_mock, app: Sanic):
     app.config.WEBSOCKET_MAX_SIZE = 44
     app.config.WEBSOCKET_PING_TIMEOUT = 48
     app.config.WEBSOCKET_PING_INTERVAL = 50
@@ -188,9 +211,10 @@ def test_app_websocket_parameters(websocket_protocol_mock, app):
         await ws.send("test")
 
     try:
-        # This will fail because WebSocketProtocol is mocked and only the call kwargs matter
+        # This will fail because WebSocketProtocol is mocked and only the
+        # call kwargs matter
         app.test_client.get("/ws")
-    except:
+    except Exception:
         pass
 
     websocket_protocol_call_args = websocket_protocol_mock.call_args
@@ -206,11 +230,9 @@ def test_app_websocket_parameters(websocket_protocol_mock, app):
     )
 
 
-def test_handle_request_with_nested_exception(app, monkeypatch):
-
+def test_handle_request_with_nested_exception(app: Sanic, monkeypatch):
     err_msg = "Mock Exception"
 
-    # Not sure how to raise an exception in app.error_handler.response(), use mock here
     def mock_error_handler_response(*args, **kwargs):
         raise Exception(err_msg)
 
@@ -227,11 +249,9 @@ def test_handle_request_with_nested_exception(app, monkeypatch):
     assert response.text == "An error occurred while handling an error"
 
 
-def test_handle_request_with_nested_exception_debug(app, monkeypatch):
-
+def test_handle_request_with_nested_exception_debug(app: Sanic, monkeypatch):
     err_msg = "Mock Exception"
 
-    # Not sure how to raise an exception in app.error_handler.response(), use mock here
     def mock_error_handler_response(*args, **kwargs):
         raise Exception(err_msg)
 
@@ -246,13 +266,14 @@ def test_handle_request_with_nested_exception_debug(app, monkeypatch):
     request, response = app.test_client.get("/", debug=True)
     assert response.status == 500
     assert response.text.startswith(
-        f"Error while handling error: {err_msg}\nStack: Traceback (most recent call last):\n"
+        f"Error while handling error: {err_msg}\n"
+        "Stack: Traceback (most recent call last):\n"
     )
 
 
-def test_handle_request_with_nested_sanic_exception(app, monkeypatch, caplog):
-
-    # Not sure how to raise an exception in app.error_handler.response(), use mock here
+def test_handle_request_with_nested_sanic_exception(
+    app: Sanic, monkeypatch, caplog
+):
     def mock_error_handler_response(*args, **kwargs):
         raise SanicException("Mock SanicException")
 
@@ -278,7 +299,7 @@ def test_handle_request_with_nested_sanic_exception(app, monkeypatch, caplog):
 
 
 def test_app_name_required():
-    with pytest.raises(SanicException):
+    with pytest.raises(TypeError):
         Sanic()
 
 
@@ -295,8 +316,12 @@ def test_app_has_test_mode_sync():
 
 
 def test_app_registry():
+    assert len(Sanic._app_registry) == 0
     instance = Sanic("test")
+    assert len(Sanic._app_registry) == 1
     assert Sanic._app_registry["test"] is instance
+    Sanic.unregister_app(instance)
+    assert len(Sanic._app_registry) == 0
 
 
 def test_app_registry_wrong_type():
@@ -330,7 +355,15 @@ def test_app_registry_retrieval_from_multiple():
 
 def test_get_app_does_not_exist():
     with pytest.raises(
-        SanicException, match='Sanic app name "does-not-exist" not found.'
+        SanicException,
+        match=(
+            "Sanic app name 'does-not-exist' not found.\n"
+            "App instantiation must occur outside "
+            "if __name__ == '__main__' "
+            "block or by using an AppLoader.\nSee "
+            "https://sanic.dev/en/guide/deployment/app-loader.html"
+            " for more details."
+        ),
     ):
         Sanic.get_app("does-not-exist")
 
@@ -365,37 +398,16 @@ def test_get_app_default_ambiguous():
         Sanic.get_app()
 
 
-def test_app_no_registry():
-    Sanic("no-register", register=False)
-    with pytest.raises(
-        SanicException, match='Sanic app name "no-register" not found.'
-    ):
-        Sanic.get_app("no-register")
-
-
-def test_app_no_registry_env():
-    environ["SANIC_REGISTER"] = "False"
-    Sanic("no-register")
-    with pytest.raises(
-        SanicException, match='Sanic app name "no-register" not found.'
-    ):
-        Sanic.get_app("no-register")
-    del environ["SANIC_REGISTER"]
-
-
-def test_app_set_attribute_warning(app):
-    with pytest.warns(DeprecationWarning) as record:
+def test_app_set_attribute_warning(app: Sanic):
+    message = (
+        "Setting variables on Sanic instances is not allowed. You should "
+        "change your Sanic instance to use instance.ctx.foo instead."
+    )
+    with pytest.raises(AttributeError, match=message):
         app.foo = 1
 
-    assert len(record) == 1
-    assert record[0].message.args[0] == (
-        "Setting variables on Sanic instances is deprecated "
-        "and will be removed in version 21.12. You should change your "
-        "Sanic instance to use instance.ctx.foo instead."
-    )
 
-
-def test_app_set_context(app):
+def test_app_set_context(app: Sanic):
     app.ctx.foo = 1
 
     retrieved = Sanic.get_app(app.name)
@@ -414,23 +426,14 @@ def test_bad_custom_config():
         SanicException,
         match=(
             "When instantiating Sanic with config, you cannot also pass "
-            "load_env or env_prefix"
-        ),
-    ):
-        Sanic("test", config=1, load_env=1)
-    with pytest.raises(
-        SanicException,
-        match=(
-            "When instantiating Sanic with config, you cannot also pass "
-            "load_env or env_prefix"
+            "env_prefix"
         ),
     ):
         Sanic("test", config=1, env_prefix=1)
 
 
 def test_custom_config():
-    class CustomConfig(Config):
-        ...
+    class CustomConfig(Config): ...
 
     config = CustomConfig()
     app = Sanic("custom", config=config)
@@ -439,8 +442,7 @@ def test_custom_config():
 
 
 def test_custom_context():
-    class CustomContext:
-        ...
+    class CustomContext: ...
 
     ctx = CustomContext()
     app = Sanic("custom", ctx=ctx)
@@ -448,7 +450,225 @@ def test_custom_context():
     assert app.ctx == ctx
 
 
-def test_cannot_run_fast_and_workers(app):
+@pytest.mark.parametrize("use", (False, True))
+def test_uvloop_config(app: Sanic, monkeypatch, use):
+    @app.get("/test", name="test")
+    def handler(request):
+        return text("ok")
+
+    try_use_uvloop = Mock()
+    monkeypatch.setattr(sanic.mixins.startup, "try_use_uvloop", try_use_uvloop)
+
+    # Default config
+    app.test_client.get("/test")
+    if OS_IS_WINDOWS:
+        try_use_uvloop.assert_not_called()
+    else:
+        try_use_uvloop.assert_called_once()
+
+    try_use_uvloop.reset_mock()
+    app.config["USE_UVLOOP"] = use
+    app.test_client.get("/test")
+
+    if use:
+        try_use_uvloop.assert_called_once()
+    else:
+        try_use_uvloop.assert_not_called()
+
+
+@pytest.mark.asyncio
+def test_uvloop_cannot_never_called_with_create_server(caplog, monkeypatch):
+    apps = (Sanic("default-uvloop"), Sanic("no-uvloop"), Sanic("yes-uvloop"))
+
+    apps[1].config.USE_UVLOOP = False
+    apps[2].config.USE_UVLOOP = True
+
+    try_use_uvloop = Mock()
+    monkeypatch.setattr(sanic.mixins.startup, "try_use_uvloop", try_use_uvloop)
+
+    loop = asyncio.get_event_loop()
+
+    with caplog.at_level(logging.WARNING):
+        for app in apps:
+            srv_coro = app.create_server(
+                return_asyncio_server=True,
+                asyncio_server_kwargs=dict(start_serving=False),
+                port=get_port(),
+            )
+            loop.run_until_complete(srv_coro)
+
+    try_use_uvloop.assert_not_called()  # Check it didn't try to change policy
+
+    message = (
+        "You are trying to change the uvloop configuration, but "
+        "this is only effective when using the run(...) method. "
+        "When using the create_server(...) method Sanic will use "
+        "the already existing loop."
+    )
+
+    counter = Counter([(r[1], r[2]) for r in caplog.record_tuples])
+    modified = sum(
+        1 for app in apps if not isinstance(app.config.USE_UVLOOP, Default)
+    )
+
+    assert counter[(logging.WARNING, message)] == modified
+
+
+@pytest.mark.asyncio
+def test_multiple_uvloop_configs_display_warning(caplog):
+    Sanic._uvloop_setting = None  # Reset the setting (changed in prev tests)
+
+    default_uvloop = Sanic("default-uvloop")
+    no_uvloop = Sanic("no-uvloop")
+    yes_uvloop = Sanic("yes-uvloop")
+
+    no_uvloop.config.USE_UVLOOP = False
+    yes_uvloop.config.USE_UVLOOP = True
+
+    loop = asyncio.get_event_loop()
+
+    with caplog.at_level(logging.WARNING):
+        for app in (default_uvloop, no_uvloop, yes_uvloop):
+            srv_coro = app.create_server(
+                return_asyncio_server=True,
+                asyncio_server_kwargs=dict(start_serving=False),
+                port=get_port(),
+            )
+            srv = loop.run_until_complete(srv_coro)
+            loop.run_until_complete(srv.startup())
+
+    message = (
+        "It looks like you're running several apps with different "
+        "uvloop settings. This is not supported and may lead to "
+        "unintended behaviour."
+    )
+
+    counter = Counter([(r[1], r[2]) for r in caplog.record_tuples])
+
+    assert counter[(logging.WARNING, message)] == 3
+
+
+def test_cannot_run_fast_and_workers(app: Sanic, port):
     message = "You cannot use both fast=True and workers=X"
     with pytest.raises(RuntimeError, match=message):
-        app.run(fast=True, workers=4)
+        app.run(fast=True, workers=4, port=port)
+
+
+def test_no_workers(app: Sanic, port):
+    with pytest.raises(RuntimeError, match="Cannot serve with no workers"):
+        app.run(workers=0, port=port)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"fast": True},
+        {"workers": 2},
+        {"auto_reload": True},
+    ),
+)
+def test_cannot_run_single_process_and_workers_or_auto_reload(
+    app: Sanic, extra, port
+):
+    message = (
+        "Single process cannot be run with multiple workers or auto-reload"
+    )
+    with pytest.raises(RuntimeError, match=message):
+        app.run(single_process=True, port=port, **extra)
+
+
+def test_default_configure_logging():
+    with patch("sanic.app.logging") as mock:
+        Sanic("Test")
+
+    mock.config.dictConfig.assert_called_with(LOGGING_CONFIG_DEFAULTS)
+
+
+def test_custom_configure_logging():
+    with patch("sanic.app.logging") as mock:
+        Sanic("Test", log_config={"foo": "bar"})
+
+    mock.config.dictConfig.assert_called_with({"foo": "bar"})
+
+
+def test_disable_configure_logging():
+    with patch("sanic.app.logging") as mock:
+        Sanic("Test", configure_logging=False)
+
+    mock.config.dictConfig.assert_not_called()
+
+
+@pytest.mark.parametrize("inspector", (True, False))
+def test_inspector(inspector):
+    app = Sanic("Test", inspector=inspector)
+    assert app.config.INSPECTOR is inspector
+
+
+def test_build_endpoint_name():
+    app = Sanic("Test")
+    name = app._build_endpoint_name("foo", "bar")
+    assert name == "Test.foo.bar"
+
+
+def test_manager_in_main_process_only(app: Sanic):
+    message = "Can only access the manager from the main process"
+
+    with pytest.raises(SanicException, match=message):
+        app.manager
+
+    app._manager = 1
+    environ["SANIC_WORKER_PROCESS"] = "ok"
+
+    with pytest.raises(SanicException, match=message):
+        app.manager
+
+    del environ["SANIC_WORKER_PROCESS"]
+
+    assert app.manager == 1
+
+
+def test_inspector_in_main_process_only(app: Sanic):
+    message = "Can only access the inspector from the main process"
+
+    with pytest.raises(SanicException, match=message):
+        app.inspector
+
+    app._inspector = 1
+    environ["SANIC_WORKER_PROCESS"] = "ok"
+
+    with pytest.raises(SanicException, match=message):
+        app.inspector
+
+    del environ["SANIC_WORKER_PROCESS"]
+
+    assert app.inspector == 1
+
+
+def test_stop_trigger_terminate(app: Sanic):
+    app.multiplexer = Mock()
+
+    app.stop()
+
+    app.multiplexer.terminate.assert_called_once()
+    app.multiplexer.reset_mock()
+    assert len(Sanic._app_registry) == 1
+    Sanic._app_registry.clear()
+
+    app.stop(terminate=True)
+
+    app.multiplexer.terminate.assert_called_once()
+    app.multiplexer.reset_mock()
+    assert len(Sanic._app_registry) == 0
+    Sanic._app_registry.clear()
+
+    app.stop(unregister=False)
+    app.multiplexer.terminate.assert_called_once()
+
+
+def test_refresh_pass_passthru_data_to_new_instance(app: Sanic):
+    # arrange
+    passthru = {"_inspector": 2, "config": {"TOUCHUP": 23}}
+    app = app.refresh(passthru)
+
+    assert app.inspector == 2
+    assert app.config.TOUCHUP == 23

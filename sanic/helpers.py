@@ -1,11 +1,24 @@
 """Defines basics of HTTP standard."""
 
+import sys
+
+from functools import partial
 from importlib import import_module
 from inspect import ismodule
-from typing import Dict
 
 
-STATUS_CODES: Dict[int, bytes] = {
+try:
+    from ujson import dumps as ujson_dumps
+
+    json_dumps = partial(ujson_dumps, escape_forward_slashes=False)
+except ImportError:
+    # This is done in order to ensure that the JSON response is
+    # kept consistent across both ujson and inbuilt json usage.
+    from json import dumps
+
+    json_dumps = partial(dumps, separators=(",", ":"))
+
+STATUS_CODES: dict[int, bytes] = {
     100: b"Continue",
     101: b"Switching Protocols",
     102: b"Processing",
@@ -120,31 +133,12 @@ def is_hop_by_hop_header(header):
     return header.lower() in _HOP_BY_HOP_HEADERS
 
 
-def remove_entity_headers(headers, allowed=("content-location", "expires")):
-    """
-    Removes all the entity headers present in the headers given.
-    According to RFC 2616 Section 10.3.5,
-    Content-Location and Expires are allowed as for the
-    "strong cache validator".
-    https://tools.ietf.org/html/rfc2616#section-10.3.5
-
-    returns the headers without the entity headers
-    """
-    allowed = set([h.lower() for h in allowed])
-    headers = {
-        header: value
-        for header, value in headers.items()
-        if not is_entity_header(header) or header.lower() in allowed
-    }
-    return headers
-
-
 def import_string(module_name, package=None):
     """
     import a module or class by string path.
 
     :module_name: str with path of module or path to import and
-    instanciate a class
+    instantiate a class
     :returns: a module object or one instance from class if
     module_name is a valid path to class
 
@@ -157,6 +151,10 @@ def import_string(module_name, package=None):
     return obj()
 
 
+def is_atty() -> bool:
+    return bool(sys.stdout and sys.stdout.isatty())
+
+
 class Default:
     """
     It is used to replace `None` or `object()` as a sentinel
@@ -165,7 +163,11 @@ class Default:
     default value, and `object()` is hard to be typed.
     """
 
-    pass
+    def __repr__(self):
+        return "<Default>"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 _default = Default()

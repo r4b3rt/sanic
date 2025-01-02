@@ -1,35 +1,40 @@
-from pathlib import PurePath
-from typing import Dict, Iterable, List, NamedTuple, Optional, Union
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Callable, NamedTuple, Optional, Union
 
+from sanic.handlers.directory import DirectoryHandler
 from sanic.models.handler_types import (
     ErrorMiddlewareType,
     ListenerType,
     MiddlewareType,
     SignalHandler,
 )
+from sanic.types import HashableDict
 
 
 class FutureRoute(NamedTuple):
     handler: str
     uri: str
     methods: Optional[Iterable[str]]
-    host: Union[str, List[str]]
+    host: Union[str, list[str]]
     strict_slashes: bool
     stream: bool
     version: Optional[int]
     name: str
     ignore_body: bool
     websocket: bool
-    subprotocols: Optional[List[str]]
+    subprotocols: Optional[list[str]]
     unquote: bool
     static: bool
     version_prefix: str
     error_format: Optional[str]
+    route_context: HashableDict
 
 
 class FutureListener(NamedTuple):
     listener: ListenerType
     event: str
+    priority: int
 
 
 class FutureMiddleware(NamedTuple):
@@ -39,28 +44,35 @@ class FutureMiddleware(NamedTuple):
 
 class FutureException(NamedTuple):
     handler: ErrorMiddlewareType
-    exceptions: List[BaseException]
+    exceptions: list[BaseException]
 
 
 class FutureStatic(NamedTuple):
     uri: str
-    file_or_directory: Union[str, bytes, PurePath]
+    file_or_directory: Path
     pattern: str
     use_modified_since: bool
     use_content_range: bool
-    stream_large_files: bool
+    stream_large_files: Union[bool, int]
     name: str
     host: Optional[str]
     strict_slashes: Optional[bool]
-    content_type: Optional[bool]
+    content_type: Optional[str]
     resource_type: Optional[str]
+    directory_handler: DirectoryHandler
 
 
 class FutureSignal(NamedTuple):
     handler: SignalHandler
     event: str
-    condition: Optional[Dict[str, str]]
+    condition: Optional[dict[str, str]]
+    exclusive: bool
+    priority: int
 
 
-class FutureRegistry(set):
-    ...
+class FutureRegistry(set): ...
+
+
+class FutureCommand(NamedTuple):
+    name: str
+    func: Callable

@@ -1,6 +1,6 @@
-import inspect
 import logging
 import os
+import sys
 
 from collections import Counter
 from pathlib import Path
@@ -8,17 +8,24 @@ from time import gmtime, strftime
 
 import pytest
 
-from sanic import text
-from sanic.exceptions import FileNotFound
+from sanic import Sanic, text
+from sanic.exceptions import FileNotFound, ServerError
 
 
 @pytest.fixture(scope="module")
-def static_file_directory():
-    """The static directory to serve"""
-    current_file = inspect.getfile(inspect.currentframe())
-    current_directory = os.path.dirname(os.path.abspath(current_file))
-    static_directory = os.path.join(current_directory, "static")
-    return static_directory
+def double_dotted_directory_file(static_file_directory: str):
+    """Generate double dotted directory and its files"""
+    if sys.platform == "win32":
+        raise Exception("Windows doesn't support double dotted directories")
+
+    file_path = Path(static_file_directory) / "dotted.." / "dot.txt"
+    double_dotted_dir = file_path.parent
+    Path.mkdir(double_dotted_dir, exist_ok=True)
+    with open(file_path, "w") as f:
+        f.write("DOT\n")
+    yield file_path
+    Path.unlink(file_path)
+    Path.rmdir(double_dotted_dir)
 
 
 def get_file_path(static_file_directory, file_name):
@@ -96,14 +103,39 @@ def test_static_file_pathlib(app, static_file_directory, file_name):
 
 @pytest.mark.parametrize(
     "file_name",
+    [
+        "test.file",
+        "decode me.txt",
+        "python.png",
+        "symlink",
+        "hard_link",
+    ],
+)
+def test_static_file_pathlib_relative_path_traversal(
+    app, static_file_directory, file_name
+):
+    """Get the current working directory and check if it ends with "sanic" """
+    cwd = Path.cwd()
+    if not str(cwd).endswith("sanic"):
+        pytest.skip("Current working directory does not end with 'sanic'")
+
+    file_path = "./tests/static/../static/"
+    app.static("/", file_path)
+    _, response = app.test_client.get(f"/{file_name}")
+    assert response.status == 200
+    assert response.body == get_file_content(static_file_directory, file_name)
+
+
+@pytest.mark.parametrize(
+    "file_name",
     [b"test.file", b"decode me.txt", b"python.png"],
 )
 def test_static_file_bytes(app, static_file_directory, file_name):
     bsep = os.path.sep.encode("utf-8")
     file_path = static_file_directory.encode("utf-8") + bsep + file_name
-    app.static("/testing.file", file_path)
-    request, response = app.test_client.get("/testing.file")
-    assert response.status == 200
+    message = "Static file or directory must be a path-like object or string"
+    with pytest.raises(TypeError, match=message):
+        app.static("/testing.file", file_path)
 
 
 @pytest.mark.parametrize(
@@ -292,7 +324,7 @@ def test_static_content_range_error(app, file_name, static_file_directory):
     assert response.status == 416
     assert "Content-Length" in response.headers
     assert "Content-Range" in response.headers
-    assert response.headers["Content-Range"] == "bytes */%s" % (
+    assert response.headers["Content-Range"] == "bytes */{}".format(
         len(get_file_content(static_file_directory, file_name)),
     )
 
@@ -414,7 +446,6 @@ def test_static_stream_large_file(
     "file_name", ["test.file", "decode me.txt", "python.png"]
 )
 def test_use_modified_since(app, static_file_directory, file_name):
-
     file_stat = os.stat(get_file_path(static_file_directory, file_name))
     modified_since = strftime(
         "%a, %d %b %Y %H:%M:%S GMT", gmtime(file_stat.st_mtime)
@@ -486,9 +517,10 @@ def test_stack_trace_on_not_found(app, static_file_directory, caplog):
     counter = Counter([(r[0], r[1]) for r in caplog.record_tuples])
 
     assert response.status == 404
-    assert counter[("sanic.root", logging.INFO)] == 11
+    assert counter[("sanic.root", logging.INFO)] == 10
     assert counter[("sanic.root", logging.ERROR)] == 0
     assert counter[("sanic.error", logging.ERROR)] == 0
+    assert counter[("sanic.server", logging.INFO)] == 3
 
 
 def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
@@ -504,15 +536,32 @@ def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
     counter = Counter([(r[0], r[1]) for r in caplog.record_tuples])
 
     assert response.status == 404
-    assert counter[("sanic.root", logging.INFO)] == 11
+    assert counter[("sanic.root", logging.INFO)] == 10
     assert counter[("sanic.root", logging.ERROR)] == 0
     assert counter[("sanic.error", logging.ERROR)] == 0
+    assert counter[("sanic.server", logging.INFO)] == 3
     assert response.text == "No file: /static/non_existing_file.file"
 
 
-def test_multiple_statics(app, static_file_directory):
+@pytest.mark.asyncio
+async def test_multiple_statics_error(app, static_file_directory):
     app.static("/file", get_file_path(static_file_directory, "test.file"))
     app.static("/png", get_file_path(static_file_directory, "python.png"))
+
+    message = (
+        r"Duplicate route names detected: test_multiple_statics_error\.static"
+    )
+    with pytest.raises(ServerError, match=message):
+        await app._startup()
+
+
+def test_multiple_statics(app, static_file_directory):
+    app.static(
+        "/file", get_file_path(static_file_directory, "test.file"), name="file"
+    )
+    app.static(
+        "/png", get_file_path(static_file_directory, "python.png"), name="png"
+    )
 
     _, response = app.test_client.get("/file")
     assert response.status == 200
@@ -527,9 +576,24 @@ def test_multiple_statics(app, static_file_directory):
     )
 
 
-def test_resource_type_default(app, static_file_directory):
+@pytest.mark.asyncio
+async def test_resource_type_default_error(app, static_file_directory):
     app.static("/static", static_file_directory)
     app.static("/file", get_file_path(static_file_directory, "test.file"))
+
+    message = (
+        r"Duplicate route names "
+        r"detected: test_resource_type_default_error\.static"
+    )
+    with pytest.raises(ServerError, match=message):
+        await app._startup()
+
+
+def test_resource_type_default(app, static_file_directory):
+    app.static("/static", static_file_directory, name="static")
+    app.static(
+        "/file", get_file_path(static_file_directory, "test.file"), name="file"
+    )
 
     _, response = app.test_client.get("/static")
     assert response.status == 404
@@ -578,3 +642,43 @@ def test_resource_type_dir(app, static_file_directory):
 def test_resource_type_unknown(app, static_file_directory, caplog):
     with pytest.raises(ValueError):
         app.static("/static", static_file_directory, resource_type="unknown")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows does not support double dotted directories",
+)
+def test_dotted_dir_ok(
+    app: Sanic, static_file_directory: str, double_dotted_directory_file: Path
+):
+    app.static("/foo", static_file_directory)
+    dot_relative_path = str(
+        double_dotted_directory_file.relative_to(static_file_directory)
+    )
+    _, response = app.test_client.get("/foo/" + dot_relative_path)
+    assert response.status == 200
+    assert response.body == b"DOT\n"
+
+
+def test_breakout(app: Sanic, static_file_directory: str):
+    app.static("/foo", static_file_directory)
+
+    _, response = app.test_client.get("/foo/..%2Ffake/server.py")
+    assert response.status == 404
+
+    _, response = app.test_client.get("/foo/..%2Fstatic/test.file")
+    assert response.status == 404
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Block backslash on Windows only"
+)
+def test_double_backslash_prohibited_on_win32(
+    app: Sanic, static_file_directory: str
+):
+    app.static("/foo", static_file_directory)
+
+    _, response = app.test_client.get("/foo/static/..\\static/test.file")
+    assert response.status == 404
+    _, response = app.test_client.get("/foo/static\\../static/test.file")
+    assert response.status == 404

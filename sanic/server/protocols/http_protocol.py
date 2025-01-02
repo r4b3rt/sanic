@@ -2,33 +2,98 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sanic.http.constants import HTTP
+from sanic.http.http3 import Http3
 from sanic.touchup.meta import TouchUpMeta
 
 
 if TYPE_CHECKING:
     from sanic.app import Sanic
 
+
 from asyncio import CancelledError
 from time import monotonic as current_time
 
-from sanic.exceptions import RequestTimeout, ServiceUnavailable
+from sanic.exceptions import (
+    RequestCancelled,
+    RequestTimeout,
+    ServiceUnavailable,
+)
 from sanic.http import Http, Stage
-from sanic.log import error_logger, logger
+from sanic.log import (
+    Colors,
+    access_logger,
+    error_logger,
+    logger,
+    websockets_logger,
+)
 from sanic.models.server_types import ConnInfo
 from sanic.request import Request
 from sanic.server.protocols.base_protocol import SanicProtocol
 
 
-class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
+ConnectionProtocol = type("ConnectionProtocol", (), {})
+try:
+    from aioquic.asyncio import QuicConnectionProtocol
+    from aioquic.h3.connection import H3_ALPN, H3Connection
+    from aioquic.quic.events import (
+        DatagramFrameReceived,
+        ProtocolNegotiated,
+        QuicEvent,
+    )
+
+    ConnectionProtocol = QuicConnectionProtocol
+except ModuleNotFoundError:  # no cov
+    ...
+
+
+class HttpProtocolMixin:
+    __slots__ = ()
+    __version__: HTTP
+
+    def _setup_connection(self, *args, **kwargs):
+        self._http = self.HTTP_CLASS(self, *args, **kwargs)
+        self._time = current_time()
+        try:
+            self.check_timeouts()
+        except AttributeError:
+            ...
+
+    def _setup(self):
+        self.request: Optional[Request] = None
+        self.access_log = self.app.config.ACCESS_LOG
+        self.request_handler = self.app.handle_request
+        self.error_handler = self.app.error_handler
+        self.request_timeout = self.app.config.REQUEST_TIMEOUT
+        self.response_timeout = self.app.config.RESPONSE_TIMEOUT
+        self.keep_alive_timeout = self.app.config.KEEP_ALIVE_TIMEOUT
+        self.request_max_size = self.app.config.REQUEST_MAX_SIZE
+        self.request_class = self.app.request_class or Request
+
+    @property
+    def http(self):
+        if not hasattr(self, "_http"):
+            return None
+        return self._http
+
+    @property
+    def version(self):
+        return self.__class__.__version__
+
+
+class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
     """
     This class provides implements the HTTP 1.1 protocol on top of our
     Sanic Server transport
     """
 
+    HTTP_CLASS = Http
+
     __touchup__ = (
         "send",
         "connection_task",
     )
+    __version__ = HTTP.VERSION_1
     __slots__ = (
         # request params
         "request",
@@ -49,6 +114,7 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
         "_http",
         "_exception",
         "recv_buffer",
+        "_callback_check_timeouts",
     )
 
     def __init__(
@@ -70,24 +136,12 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
             unix=unix,
         )
         self.url = None
-        self.request: Optional[Request] = None
-        self.access_log = self.app.config.ACCESS_LOG
-        self.request_handler = self.app.handle_request
-        self.error_handler = self.app.error_handler
-        self.request_timeout = self.app.config.REQUEST_TIMEOUT
-        self.response_timeout = self.app.config.RESPONSE_TIMEOUT
-        self.keep_alive_timeout = self.app.config.KEEP_ALIVE_TIMEOUT
-        self.request_max_size = self.app.config.REQUEST_MAX_SIZE
-        self.request_class = self.app.request_class or Request
         self.state = state if state else {}
+        self._setup()
         if "requests_count" not in self.state:
             self.state["requests_count"] = 0
         self._exception = None
-
-    def _setup_connection(self):
-        self._http = Http(self)
-        self._time = current_time()
-        self.check_timeouts()
+        self._callback_check_timeouts = None
 
     async def connection_task(self):  # no cov
         """
@@ -110,16 +164,12 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
             error_logger.exception("protocol.connection_task uncaught")
         finally:
             if (
-                self.app.debug
+                self.access_log
                 and self._http
                 and self.transport
                 and not self._http.upgrade_websocket
             ):
-                ip = self.transport.get_extra_info("peername")
-                error_logger.error(
-                    "Connection lost before response written"
-                    f" @ {ip} {self._http.request}"
-                )
+                self.log_disconnect()
             self._http = None
             self._task = None
             try:
@@ -134,6 +184,24 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
                 )
                 # Important to keep this Ellipsis here for the TouchUp module
                 ...
+
+    def log_disconnect(self):
+        ip = self.transport.get_extra_info("peername")
+
+        req = self._http.request
+        res = self._http.response
+        extra = {
+            "status": res.status if res else str(self._http.stage),
+            "byte": "DISCONNECTED",
+            "host": f"{id(self):X}"[-5:-1] + "unx",
+            "request": "nil",
+            "duration": "",
+        }
+        if req is not None:
+            if ip := req.client_ip:
+                extra["host"] = f"{ip}:{req.port}"
+            extra["request"] = f"{req.method} {req.url}"
+        access_logger.info("", extra=extra)
 
     def check_timeouts(self):
         """
@@ -150,7 +218,9 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
                 logger.debug("Request Timeout. Closing connection.")
                 self._http.exception = RequestTimeout("Request Timeout")
             elif stage is Stage.HANDLER and self._http.upgrade_websocket:
-                logger.debug("Handling websocket. Timeouts disabled.")
+                websockets_logger.debug(
+                    "Handling websocket. Timeouts disabled."
+                )
                 return
             elif (
                 stage in (Stage.HANDLER, Stage.RESPONSE, Stage.FAILED)
@@ -167,11 +237,25 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
                     )
                     / 2
                 )
-                self.loop.call_later(max(0.1, interval), self.check_timeouts)
+                _interval = max(0.1, interval)
+                self._callback_check_timeouts = self.loop.call_later(
+                    _interval, self.check_timeouts
+                )
                 return
-            self._task.cancel()
+            cancel_msg_args = ()
+            cancel_msg_args = ("Cancel connection task with a timeout",)
+            self._task.cancel(*cancel_msg_args)
         except Exception:
             error_logger.exception("protocol.check_timeouts")
+
+    def close(self, timeout: Optional[float] = None):
+        """
+        Requires to prevent checking timeouts for closed connections
+        """
+
+        if self._callback_check_timeouts:
+            self._callback_check_timeouts.cancel()
+        return super().close(timeout=timeout)
 
     async def send(self, data):  # no cov
         """
@@ -179,7 +263,7 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
         """
         await self._can_write.wait()
         if self.transport.is_closing():
-            raise CancelledError
+            raise RequestCancelled
         await self.app.dispatch(
             "http.lifecycle.send",
             inline=True,
@@ -219,7 +303,6 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
             error_logger.exception("protocol.connect_made")
 
     def data_received(self, data: bytes):
-
         try:
             self._time = current_time()
             if not data:
@@ -236,3 +319,39 @@ class HttpProtocol(SanicProtocol, metaclass=TouchUpMeta):
                 self._data_received.set()
         except Exception:
             error_logger.exception("protocol.data_received")
+
+
+class Http3Protocol(HttpProtocolMixin, ConnectionProtocol):  # type: ignore
+    HTTP_CLASS = Http3
+    __version__ = HTTP.VERSION_3
+
+    def __init__(self, *args, app: Sanic, **kwargs) -> None:
+        self.app = app
+        super().__init__(*args, **kwargs)
+        self._setup()
+        self._connection: Optional[H3Connection] = None
+
+    def quic_event_received(self, event: QuicEvent) -> None:
+        logger.debug(
+            f"{Colors.BLUE}[quic_event_received]: "
+            f"{Colors.PURPLE}{event}{Colors.END}",
+            extra={"verbosity": 2},
+        )
+        if isinstance(event, ProtocolNegotiated):
+            self._setup_connection(transmit=self.transmit)
+            if event.alpn_protocol in H3_ALPN:
+                self._connection = H3Connection(
+                    self._quic, enable_webtransport=True
+                )
+        elif isinstance(event, DatagramFrameReceived):
+            if event.data == b"quack":
+                self._quic.send_datagram_frame(b"quack-ack")
+
+        #  pass event to the HTTP layer
+        if self._connection is not None:
+            for http_event in self._connection.handle_event(event):
+                self._http.http_event_received(http_event)
+
+    @property
+    def connection(self) -> Optional[H3Connection]:
+        return self._connection

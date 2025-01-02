@@ -1,9 +1,10 @@
 import asyncio
-import sys
 
-from typing import Any, Awaitable, Callable, MutableMapping, Optional, Union
+from collections.abc import Awaitable, MutableMapping
+from typing import Any, Callable, Optional, Union
 
-from sanic.exceptions import InvalidUsage
+from sanic.exceptions import BadRequest
+from sanic.models.protocol_types import TransportProtocol
 from sanic.server.websockets.connection import WebSocketConnection
 
 
@@ -13,22 +14,12 @@ ASGISend = Callable[[ASGIMessage], Awaitable[None]]
 ASGIReceive = Callable[[], Awaitable[ASGIMessage]]
 
 
-class MockProtocol:
+class MockProtocol:  # no cov
     def __init__(self, transport: "MockTransport", loop):
-        # This should be refactored when < 3.8 support is dropped
         self.transport = transport
-        # Fixup for 3.8+; Sanic still supports 3.7 where loop is required
-        loop = loop if sys.version_info[:2] < (3, 8) else None
-        # Optional in 3.9, necessary in 3.10 because the parameter "loop"
-        # was completely removed
-        if not loop:
-            self._not_paused = asyncio.Event()
-            self._not_paused.set()
-            self._complete = asyncio.Event()
-        else:
-            self._not_paused = asyncio.Event(loop=loop)
-            self._not_paused.set()
-            self._complete = asyncio.Event(loop=loop)
+        self._not_paused = asyncio.Event()
+        self._not_paused.set()
+        self._complete = asyncio.Event()
 
     def pause_writing(self) -> None:
         self._not_paused.clear()
@@ -56,7 +47,7 @@ class MockProtocol:
         await self._not_paused.wait()
 
 
-class MockTransport:
+class MockTransport(TransportProtocol):  # no cov
     _protocol: Optional[MockProtocol]
 
     def __init__(
@@ -66,25 +57,27 @@ class MockTransport:
         self._receive = receive
         self._send = send
         self._protocol = None
-        self.loop = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def get_protocol(self) -> MockProtocol:
+    def get_protocol(self) -> MockProtocol:  # type: ignore
         if not self._protocol:
             self._protocol = MockProtocol(self, self.loop)
         return self._protocol
 
-    def get_extra_info(self, info: str) -> Union[str, bool, None]:
+    def get_extra_info(
+        self, info: str, default=None
+    ) -> Optional[Union[str, bool]]:
         if info == "peername":
             return self.scope.get("client")
         elif info == "sslcontext":
             return self.scope.get("scheme") in ["https", "wss"]
-        return None
+        return default
 
     def get_websocket_connection(self) -> WebSocketConnection:
         try:
             return self._websocket_connection
         except AttributeError:
-            raise InvalidUsage("Improper websocket connection.")
+            raise BadRequest("Improper websocket connection.")
 
     def create_websocket_connection(
         self, send: ASGISend, receive: ASGIReceive

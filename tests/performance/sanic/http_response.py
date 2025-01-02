@@ -3,8 +3,6 @@ import os
 import sys
 import timeit
 
-import asyncpg
-
 from sanic.response import json
 
 
@@ -25,10 +23,10 @@ for n in range(6):
         setup="from sanic.response import json",
         number=100000,
     )
-    print("Took {} seconds".format(time))
+    print(f"Took {time} seconds")
     total_time += time
     times += 1
-print("Average: {}".format(total_time / times))
+print(f"Average: {total_time / times}")
 
 print("Running Old 100,000 times")
 times = 0
@@ -39,7 +37,7 @@ for n in range(6):
         setup="from sanic.response import json",
         number=100000,
     )
-    print("Took {} seconds".format(time))
+    print(f"Took {time} seconds")
     total_time += time
     times += 1
-print("Average: {}".format(total_time / times))
+print(f"Average: {total_time / times}")

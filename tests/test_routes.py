@@ -1,8 +1,6 @@
 import asyncio
 import re
 
-from unittest.mock import Mock
-
 import pytest
 
 from sanic_routing.exceptions import (
@@ -14,9 +12,9 @@ from sanic_testing.testing import SanicTestClient
 
 from sanic import Blueprint, Sanic
 from sanic.constants import HTTP_METHODS
-from sanic.exceptions import NotFound, SanicException
+from sanic.exceptions import NotFound, SanicException, ServerError
 from sanic.request import Request
-from sanic.response import json, text
+from sanic.response import empty, json, text
 
 
 @pytest.mark.parametrize(
@@ -256,7 +254,7 @@ def test_route_strict_slash(app):
 
 
 def test_route_invalid_parameter_syntax(app):
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidUsage):
 
         @app.get("/get/<:str>", strict_slashes=True)
         def handler(request):
@@ -504,7 +502,7 @@ def test_dynamic_route_int(app):
 
     request, response = app.test_client.get("/folder/12345")
     assert response.text == "OK"
-    assert type(results[0]) is int
+    assert isinstance(results[0], int)
 
     request, response = app.test_client.get("/folder/asdf")
     assert response.status == 404
@@ -520,7 +518,7 @@ def test_dynamic_route_number(app):
 
     request, response = app.test_client.get("/weight/12345")
     assert response.text == "OK"
-    assert type(results[0]) is float
+    assert isinstance(results[0], float)
 
     request, response = app.test_client.get("/weight/1234.56")
     assert response.status == 200
@@ -569,7 +567,7 @@ def test_dynamic_route_uuid(app):
     url = "/quirky/123e4567-e89b-12d3-a456-426655440000"
     request, response = app.test_client.get(url)
     assert response.text == "OK"
-    assert type(results[0]) is uuid.UUID
+    assert isinstance(results[0], uuid.UUID)
 
     generated_uuid = uuid.uuid4()
     request, response = app.test_client.get(f"/quirky/{generated_uuid}")
@@ -642,8 +640,7 @@ def test_websocket_route_invalid_handler(app):
     with pytest.raises(ValueError) as e:
 
         @app.websocket("/")
-        async def handler():
-            ...
+        async def handler(): ...
 
     assert e.match(
         r"Required parameter `request` and/or `ws` missing in the "
@@ -652,11 +649,9 @@ def test_websocket_route_invalid_handler(app):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", ["/ws", "ws"])
+@pytest.mark.parametrize("url", ["/ws", "/ws/"])
 async def test_websocket_route_asgi(app, url):
-    @app.after_server_start
-    async def setup_ev(app, _):
-        app.ctx.ev = asyncio.Event()
+    app.ctx.ev = asyncio.Event()
 
     @app.websocket(url)
     async def handler(request, ws):
@@ -667,7 +662,7 @@ async def test_websocket_route_asgi(app, url):
         return json({"set": request.app.ctx.ev.is_set()})
 
     _, response = await app.asgi_client.websocket(url)
-    _, response = await app.asgi_client.get("/")
+    _, response = await app.asgi_client.get("/ev")
     assert response.json["set"]
 
 
@@ -724,7 +719,6 @@ def test_add_webscoket_route_with_version(app):
 
 
 def test_route_duplicate(app):
-
     with pytest.raises(RouteExists):
 
         @app.route("/test")
@@ -747,8 +741,8 @@ def test_route_duplicate(app):
 
 
 def test_double_stack_route(app):
-    @app.route("/test/1")
-    @app.route("/test/2")
+    @app.route("/test/1", name="test1")
+    @app.route("/test/2", name="test2")
     async def handler1(request):
         return text("OK")
 
@@ -759,11 +753,11 @@ def test_double_stack_route(app):
 
 
 @pytest.mark.asyncio
-async def test_websocket_route_asgi(app):
+async def test_websocket_route_asgi_when_first_and_second_set(app):
     ev = asyncio.Event()
 
-    @app.websocket("/test/1")
-    @app.websocket("/test/2")
+    @app.websocket("/test/1", name="test1")
+    @app.websocket("/test/2", name="test2")
     async def handler(request, ws):
         ev.set()
 
@@ -805,8 +799,22 @@ def test_static_add_route(app, strict_slashes):
     assert response.text == "OK2"
 
 
-def test_dynamic_add_route(app):
+@pytest.mark.parametrize("unquote", [True, False, None])
+def test_unquote_add_route(app, unquote):
+    async def handler1(_, foo):
+        return text(foo)
 
+    app.add_route(handler1, "/<foo>", unquote=unquote)
+    value = "啊" if unquote else r"%E5%95%8A"
+
+    _, response = app.test_client.get("/啊")
+    assert response.text == value
+
+    _, response = app.test_client.get(r"/%E5%95%8A")
+    assert response.text == value
+
+
+def test_dynamic_add_route(app):
     results = []
 
     async def handler(request, name):
@@ -821,7 +829,6 @@ def test_dynamic_add_route(app):
 
 
 def test_dynamic_add_route_string(app):
-
     results = []
 
     async def handler(request, name):
@@ -851,7 +858,7 @@ def test_dynamic_add_route_int(app):
 
     request, response = app.test_client.get("/folder/12345")
     assert response.text == "OK"
-    assert type(results[0]) is int
+    assert isinstance(results[0], int)
 
     request, response = app.test_client.get("/folder/asdf")
     assert response.status == 404
@@ -868,7 +875,7 @@ def test_dynamic_add_route_number(app):
 
     request, response = app.test_client.get("/weight/12345")
     assert response.text == "OK"
-    assert type(results[0]) is float
+    assert isinstance(results[0], float)
 
     request, response = app.test_client.get("/weight/1234.56")
     assert response.status == 200
@@ -925,7 +932,6 @@ def test_dynamic_add_route_unhashable(app):
 
 
 def test_add_route_duplicate(app):
-
     with pytest.raises(RouteExists):
 
         async def handler1(request):
@@ -1107,7 +1113,6 @@ def test_route_raise_ParameterNameConflicts(app):
 
 
 def test_route_invalid_host(app):
-
     host = 321
     with pytest.raises(ValueError) as excinfo:
 
@@ -1121,7 +1126,7 @@ def test_route_invalid_host(app):
 
 
 def test_route_with_regex_group(app):
-    @app.route("/path/to/<ext:file\.(txt)>")
+    @app.route(r"/path/to/<ext:file\.(txt)>")
     async def handler(request, ext):
         return text(ext)
 
@@ -1152,7 +1157,7 @@ def test_route_with_regex_named_group_invalid(app):
 
 
 def test_route_with_regex_group_ambiguous(app):
-    @app.route("/path/to/<ext:file(?:\.)(txt)>")
+    @app.route(r"/path/to/<ext:file(?:\.)(txt)>")
     async def handler(request, ext):
         return text(ext)
 
@@ -1161,7 +1166,7 @@ def test_route_with_regex_group_ambiguous(app):
 
     assert e.match(
         re.escape(
-            "Could not compile pattern file(?:\.)(txt). Try using a named "
+            r"Could not compile pattern file(?:\.)(txt). Try using a named "
             "group instead: '(?P<ext>your_matching_group)'"
         )
     )
@@ -1230,3 +1235,57 @@ def test_routes_with_and_without_slash_definitions(app):
         _, response = app.test_client.post(f"/{term}/")
         assert response.status == 200
         assert response.text == f"{term}_with"
+
+
+def test_added_route_ctx_kwargs(app):
+    @app.route("/", ctx_foo="foo", ctx_bar=99)
+    async def handler(request: Request):
+        return empty()
+
+    request, _ = app.test_client.get("/")
+
+    assert request.route.ctx.foo == "foo"
+    assert request.route.ctx.bar == 99
+
+
+def test_added_bad_route_kwargs(app):
+    message = "Unexpected keyword arguments: foo, bar"
+    with pytest.raises(TypeError, match=message):
+
+        @app.route("/", foo="foo", bar=99)
+        async def handler(request: Request): ...
+
+
+@pytest.mark.asyncio
+async def test_added_callable_route_ctx_kwargs(app):
+    def foo(*args, **kwargs):
+        return "foo"
+
+    async def bar(*args, **kwargs):
+        return 99
+
+    @app.route("/", ctx_foo=foo, ctx_bar=bar)
+    async def handler(request: Request):
+        return empty()
+
+    request, _ = await app.asgi_client.get("/")
+
+    assert request.route.ctx.foo() == "foo"
+    assert await request.route.ctx.bar() == 99
+
+
+@pytest.mark.asyncio
+async def test_duplicate_route_error(app):
+    @app.route("/foo", name="duped")
+    async def handler_foo(request):
+        return text("...")
+
+    @app.route("/bar", name="duped")
+    async def handler_bar(request):
+        return text("...")
+
+    message = (
+        "Duplicate route names detected: test_duplicate_route_error.duped."
+    )
+    with pytest.raises(ServerError, match=message):
+        await app._startup()

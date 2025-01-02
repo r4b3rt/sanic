@@ -35,7 +35,10 @@ LOG_SETTINGS = {
     },
     "formatters": {
         "default": {
-            "format": "%(asctime)s %(levelname)s %(name)s:%(lineno)d %(request_id)s | %(message)s",
+            "format": (
+                "%(asctime)s %(levelname)s %(name)s:%(lineno)d"
+                " %(request_id)s | %(message)s"
+            ),
         },
     },
     "loggers": {
@@ -44,7 +47,7 @@ LOG_SETTINGS = {
 }
 
 
-app = Sanic(__name__, log_config=LOG_SETTINGS)
+app = Sanic("Example", log_config=LOG_SETTINGS)
 
 
 @app.on_request

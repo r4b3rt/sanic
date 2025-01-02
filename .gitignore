@@ -21,4 +21,6 @@ dist/*
 pip-wheel-metadata/
 .pytest_cache/*
 .venv/*
+venv/*
 .vscode/*
+guide/node_modules/

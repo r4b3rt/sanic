@@ -1,14 +1,11 @@
 import asyncio
 
-from contextlib import closing
-from socket import socket
-
 import pytest
 
 from sanic import Sanic
 from sanic.blueprints import Blueprint
 from sanic.response import json, text
-from sanic.views import CompositionView, HTTPMethodView
+from sanic.views import HTTPMethodView
 from sanic.views import stream as stream_decorator
 
 
@@ -423,33 +420,6 @@ def test_request_stream_blueprint(app):
     assert response.text == data
 
 
-def test_request_stream_composition_view(app):
-    def get_handler(request):
-        return text("OK")
-
-    async def post_handler(request):
-        result = ""
-        while True:
-            body = await request.stream.read()
-            if body is None:
-                break
-            result += body.decode("utf-8")
-        return text(result)
-
-    view = CompositionView()
-    view.add(["GET"], get_handler)
-    view.add(["POST"], post_handler, stream=True)
-    app.add_route(view, "/composition_view")
-
-    request, response = app.test_client.get("/composition_view")
-    assert response.status == 200
-    assert response.text == "OK"
-
-    request, response = app.test_client.post("/composition_view", data=data)
-    assert response.status == 200
-    assert response.text == data
-
-
 def test_request_stream(app):
     """test for complex application"""
     bp = Blueprint("test_blueprint_request_stream")
@@ -510,27 +480,13 @@ def test_request_stream(app):
 
     app.add_route(SimpleView.as_view(), "/method_view")
 
-    view = CompositionView()
-    view.add(["GET"], get_handler)
-    view.add(["POST"], post_handler, stream=True)
-
     app.blueprint(bp)
-
-    app.add_route(view, "/composition_view")
 
     request, response = app.test_client.get("/method_view")
     assert response.status == 200
     assert response.text == "OK"
 
     request, response = app.test_client.post("/method_view", data=data)
-    assert response.status == 200
-    assert response.text == data
-
-    request, response = app.test_client.get("/composition_view")
-    assert response.status == 200
-    assert response.text == "OK"
-
-    request, response = app.test_client.post("/composition_view", data=data)
     assert response.status == 200
     assert response.text == data
 
@@ -593,7 +549,7 @@ def test_streaming_new_api(app):
 
 def test_streaming_echo():
     """2-way streaming chat between server and client."""
-    app = Sanic(name=__name__)
+    app = Sanic(name="Test")
 
     @app.post("/echo", stream=True)
     async def handler(request):
@@ -609,15 +565,15 @@ def test_streaming_echo():
     @app.listener("after_server_start")
     async def client_task(app, loop):
         try:
-            reader, writer = await asyncio.open_connection(*addr)
+            reader, writer = await asyncio.open_connection("localhost", 8000)
             await client(app, reader, writer)
         finally:
             writer.close()
             app.stop()
 
     async def client(app, reader, writer):
-        # Unfortunately httpx does not support 2-way streaming, so do it by hand.
-        host = f"host: {addr[0]}:{addr[1]}\r\n".encode()
+        # httpx doesn't support 2-way streaming,so do it by hand.
+        host = b"host: localhost:8000\r\n"
         writer.write(
             b"POST /echo HTTP/1.1\r\n" + host + b"content-length: 2\r\n"
             b"content-type: text/plain; charset=utf-8\r\n"
@@ -625,7 +581,7 @@ def test_streaming_echo():
         )
         # Read response
         res = b""
-        while not b"\r\n\r\n" in res:
+        while b"\r\n\r\n" not in res:
             res += await reader.read(4096)
         assert res.startswith(b"HTTP/1.1 200 OK\r\n")
         assert res.endswith(b"\r\n\r\n")
@@ -633,7 +589,7 @@ def test_streaming_echo():
 
         async def read_chunk():
             nonlocal buffer
-            while not b"\r\n" in buffer:
+            while b"\r\n" not in buffer:
                 data = await reader.read(4096)
                 assert data
                 buffer += data
@@ -662,10 +618,6 @@ def test_streaming_echo():
         assert res == b"-"
 
         res = await read_chunk()
-        assert res == None
+        assert res is None
 
-    # Use random port for tests
-    with closing(socket()) as sock:
-        sock.bind(("127.0.0.1", 0))
-        addr = sock.getsockname()
-        app.run(sock=sock, access_log=False)
+    app.run(access_log=False, single_process=True)

@@ -1,14 +1,11 @@
+import pytest
+
 from pytest import raises
 
 from sanic.app import Sanic
 from sanic.blueprint_group import BlueprintGroup
 from sanic.blueprints import Blueprint
-from sanic.exceptions import (
-    Forbidden,
-    InvalidUsage,
-    SanicException,
-    ServerError,
-)
+from sanic.exceptions import BadRequest, Forbidden, SanicException, ServerError
 from sanic.request import Request
 from sanic.response import HTTPResponse, text
 
@@ -25,8 +22,18 @@ def test_bp_group_indexing(app: Sanic):
     group = Blueprint.group(blueprint_1, blueprint_2)
     assert group[0] == blueprint_1
 
-    with raises(expected_exception=IndexError) as e:
+    with raises(expected_exception=IndexError):
         _ = group[3]
+
+
+def test_bp_group_set_item_by_index(app: Sanic):
+    blueprint_1 = Blueprint("blueprint_1", url_prefix="/bp1")
+    blueprint_2 = Blueprint("blueprint_2", url_prefix="/bp2")
+
+    group = Blueprint.group(blueprint_1, blueprint_2)
+    group[0] = blueprint_2
+
+    assert group[0] == blueprint_2
 
 
 def test_bp_group_with_additional_route_params(app: Sanic):
@@ -104,7 +111,7 @@ def test_bp_group(app: Sanic):
 
     @blueprint_1.route("/invalid")
     def blueprint_1_error(request: Request):
-        raise InvalidUsage("Invalid")
+        raise BadRequest("Invalid")
 
     @blueprint_2.route("/")
     def blueprint_2_default_route(request):
@@ -120,7 +127,7 @@ def test_bp_group(app: Sanic):
 
     blueprint_3 = Blueprint("blueprint_3", url_prefix="/bp3")
 
-    @blueprint_group_1.exception(InvalidUsage)
+    @blueprint_group_1.exception(BadRequest)
     def handle_group_exception(request, exception):
         return text("BP1_ERR_OK")
 
@@ -328,3 +335,57 @@ def test_bp_group_properties():
     assert "api/v1/grouped/bp2/" in routes
     assert "api/v1/primary/grouped/bp1" in routes
     assert "api/v1/primary/grouped/bp2" in routes
+
+
+def test_nested_bp_group_properties():
+    one = Blueprint("one", url_prefix="/one")
+    two = Blueprint.group(one)
+    three = Blueprint.group(two, url_prefix="/three")
+
+    @one.route("/four")
+    def handler(request):
+        return text("pi")
+
+    app = Sanic("PropTest")
+    app.blueprint(three)
+    app.router.finalize()
+
+    routes = [route.path for route in app.router.routes]
+    assert routes == ["three/one/four"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_nested_bp_group():
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+    bp2 = Blueprint("bp2", url_prefix="/bp2")
+
+    bp1.add_route(lambda _: ..., "/", name="route1")
+    bp2.add_route(lambda _: ..., "/", name="route2")
+
+    group_a = Blueprint.group(
+        bp1, bp2, url_prefix="/group-a", name_prefix="group-a"
+    )
+    group_b = Blueprint.group(
+        bp1, bp2, url_prefix="/group-b", name_prefix="group-b"
+    )
+
+    app = Sanic("PropTest")
+    app.blueprint(group_a)
+    app.blueprint(group_b)
+
+    await app._startup()
+
+    routes = [route.path for route in app.router.routes]
+    assert routes == [
+        "group-a/bp1",
+        "group-a/bp2",
+        "group-b/bp1",
+        "group-b/bp2",
+    ]
+    names = [route.name for route in app.router.routes]
+    assert names == [
+        "PropTest.group-a_bp1.route1",
+        "PropTest.group-a_bp2.route2",
+        "PropTest.group-b_bp1.route1",
+        "PropTest.group-b_bp2.route2",
+    ]

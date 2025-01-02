@@ -7,6 +7,8 @@ and pass in an instance of it when we create our Sanic instance. Inside this
 class' default handler, we can do anything including sending exceptions to
 an external service.
 """
+
+from sanic import Sanic
 from sanic.exceptions import SanicException
 from sanic.handlers import ErrorHandler
 
@@ -37,11 +39,9 @@ This is an ordinary Sanic server, with the exception that we set the
 server's error_handler to an instance of our CustomHandler
 """
 
-from sanic import Sanic
-
 
 handler = CustomHandler()
-app = Sanic(__name__, error_handler=handler)
+app = Sanic("Example", error_handler=handler)
 
 
 @app.route("/")
